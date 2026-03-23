@@ -7,6 +7,18 @@ const HARDCODED_GROUP_COOKIE = "uev2.id.session_v2=cfa0cf3d-b0d2-414c-984b-011f3
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  return next();
+});
+
 app.use(express.static('public'));
 app.use(express.json({ limit: '200kb' }));
 
