@@ -77,15 +77,20 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       };
     }
 
-    const result = extractOrderData(html, parsed.toString());
+    const resolvedUrl = response.url || parsed.toString();
+
+    const result = extractOrderData(html, resolvedUrl);
     result.diagnostics.authCookieProvided = useAuthCookie;
 
     if (useAuthCookie && result.itemCount === 0) {
-      const draftOrderFallback = await extractItemsWithDraftOrderByUuid(parsed.toString(), effectiveCookie);
+      const draftOrderFallback = await extractItemsWithDraftOrderByUuid(resolvedUrl, effectiveCookie, html);
       result.diagnostics.draftOrderByUuidFallback = {
         attempted: true,
         used: false,
-        reason: draftOrderFallback.reason || null
+        reason: draftOrderFallback.reason || null,
+        autoJoinAttempted: Boolean(draftOrderFallback.autoJoin && draftOrderFallback.autoJoin.attempted),
+        autoJoinSucceeded: Boolean(draftOrderFallback.autoJoin && draftOrderFallback.autoJoin.ok),
+        autoJoinReason: (draftOrderFallback.autoJoin && draftOrderFallback.autoJoin.reason) || null
       };
 
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
@@ -511,7 +516,11 @@ function formatPrice(price) {
   }
 
   if (typeof price === 'number') {
-    return Number.isFinite(price) ? `$${price.toFixed(2)}` : null;
+    if (!Number.isFinite(price)) {
+      return null;
+    }
+    const normalizedAmount = normalizeCurrencyAmount(price, {});
+    return `$${normalizedAmount.toFixed(2)}`;
   }
 
   if (typeof price === 'object') {
@@ -523,18 +532,51 @@ function formatPrice(price) {
       return cleanText(price.formattedPrice);
     }
 
+    if (typeof price.displayPrice === 'string') {
+      return cleanText(price.displayPrice);
+    }
+
     const amount = price.amount ?? price.value;
     const currencyCode = price.currencyCode ?? price.currency;
 
     if (typeof amount === 'number') {
+      const normalizedAmount = normalizeCurrencyAmount(amount, price);
       if (currencyCode && typeof currencyCode === 'string') {
-        return `${currencyCode} ${amount.toFixed(2)}`;
+        return `${currencyCode} ${normalizedAmount.toFixed(2)}`;
       }
-      return `$${amount.toFixed(2)}`;
+      return `$${normalizedAmount.toFixed(2)}`;
     }
   }
 
   return null;
+}
+
+function normalizeCurrencyAmount(amount, priceObj) {
+  if (!Number.isFinite(amount)) {
+    return amount;
+  }
+
+  const explicitMinorUnitKeys = [
+    'amountInMinorUnits',
+    'amountMinor',
+    'minorAmount',
+    'valueInCents',
+    'amountInCents',
+    'cents'
+  ];
+
+  for (const key of explicitMinorUnitKeys) {
+    if (typeof priceObj[key] === 'number' && Number.isFinite(priceObj[key])) {
+      return Number(priceObj[key]) / 100;
+    }
+  }
+
+  // Uber payloads frequently return integer cents for item-level amounts.
+  if (Number.isInteger(amount) && Math.abs(amount) >= 100 && Math.abs(amount) <= 200000) {
+    return amount / 100;
+  }
+
+  return amount;
 }
 
 function cleanText(text) {
@@ -559,18 +601,25 @@ function buildRequestHeaders(cookieHeader) {
   return headers;
 }
 
-async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader) {
-  const draftOrderUUID = extractDraftOrderUUID(sourceUrl, cookieHeader);
+async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
+  const draftOrderUUID = extractDraftOrderUUID(sourceUrl, cookieHeader, html);
   if (!draftOrderUUID) {
     return {
       ok: false,
       reason: 'missing-draft-order-uuid',
+      autoJoin: {
+        attempted: false,
+        ok: false,
+        reason: 'missing-draft-order-uuid'
+      },
       items: []
     };
   }
 
   const cookieMap = parseCookieMap(cookieHeader);
   const loc = parseLocationCookie(cookieMap.get('uev2.loc'));
+
+  const autoJoin = await addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc);
 
   const requestHeaders = {
     accept: '*/*',
@@ -603,6 +652,7 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader) {
       return {
         ok: false,
         reason: `draft-order-http-${response.status}`,
+        autoJoin,
         items: []
       };
     }
@@ -614,38 +664,328 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader) {
       return {
         ok: false,
         reason: 'draft-order-invalid-json',
+        autoJoin,
         items: []
       };
     }
 
     const extractedItems = extractItemsFromDraftOrderPayload(json);
+    const checkoutPrices = await fetchCheckoutPresentationPriceMap(
+      sourceUrl,
+      cookieHeader,
+      draftOrderUUID,
+      cookieMap,
+      loc
+    );
+    const pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
+
     return {
       ok: true,
-      reason: extractedItems.length > 0 ? null : 'draft-order-no-item-names',
-      items: extractedItems
+      reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
+      autoJoin,
+      items: pricedItems
     };
   } catch (error) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
+      autoJoin,
       items: []
     };
   }
 }
 
-function extractDraftOrderUUID(sourceUrl, cookieHeader) {
+async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
+  const requestHeaders = {
+    accept: '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'content-type': 'application/json',
+    'x-csrf-token': cookieMap.get('csrf_token') || 'x',
+    'x-uber-ciid': cookieMap.get('x-uber-ciid') || randomUUID(),
+    'x-uber-client-gitref': 'bd7681663ce1c75fe98231630f5e575b336e542d',
+    'x-uber-request-id': randomUUID(),
+    'x-uber-session-id': cookieMap.get('uev2.id.session') || randomUUID(),
+    referer: sourceUrl,
+    cookie: cookieHeader,
+    priority: 'u=1, i'
+  };
+
+  if (loc && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
+    requestHeaders['x-uber-target-location-latitude'] = String(loc.latitude);
+    requestHeaders['x-uber-target-location-longitude'] = String(loc.longitude);
+  }
+
+  const requestBody = {
+    payloadTypes: [
+      'cartItems',
+      'subtotal',
+      'basketSize',
+      'promotion',
+      'restrictedItems',
+      'venueSectionPicker',
+      'locationInfo',
+      'upsellCatalogSections',
+      'subTotalFareBreakdown',
+      'canonicalProductStorePickerPayload',
+      'storeSwitcherActionableBannerPayload',
+      'fareBreakdown',
+      'promoAndMembershipSavingBannerPayload',
+      'passBanner',
+      'passBannerOnCartPayload',
+      'merchantMembership',
+      'giftInfo',
+      'total',
+      'paymentProfilesEligibility',
+      'requestUtensilPayload',
+      'upsellFeed',
+      'upfrontTipping',
+      'promoAndMembershipSavingBannerPayloadCheckout',
+      'deliveryOptInInfo',
+      'eta',
+      'orderConfirmations'
+    ],
+    draftOrderUUID,
+    isGroupOrder: true,
+    clientFeaturesData: {
+      paymentSelectionContext: {
+        value: '{"deviceContext":{"thirdPartyApplications":["google_pay","venmo"]}}'
+      }
+    }
+  };
+
+  try {
+    const response = await fetch('https://www.ubereats.com/_p/api/getCheckoutPresentationV1', {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      return { byId: new Map(), byNameQty: new Map() };
+    }
+
+    const text = await response.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return { byId: new Map(), byNameQty: new Map() };
+    }
+
+    return extractCheckoutPriceMap(json);
+  } catch {
+    return { byId: new Map(), byNameQty: new Map() };
+  }
+}
+
+function extractCheckoutPriceMap(payload) {
+  const byId = new Map();
+  const byNameQty = new Map();
+
+  const walk = (value) => {
+    if (!value) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        walk(entry);
+      }
+      return;
+    }
+
+    if (typeof value !== 'object') {
+      return;
+    }
+
+    const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
+    const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
+    const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
+    const candidatePrice =
+      formatPrice(
+        value.totalPrice ?? value.price ?? value.unitPrice ?? value.subtotal ?? value.amount ?? value.priceInfo
+      ) || null;
+    const candidateId = cleanText(
+      value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
+    );
+
+    if (candidatePrice && candidateName) {
+      const key = `${candidateName.toLowerCase()}::${candidateQty}`;
+      if (!byNameQty.has(key)) {
+        byNameQty.set(key, candidatePrice);
+      }
+    }
+
+    if (candidatePrice && candidateId && !byId.has(candidateId)) {
+      byId.set(candidateId, candidatePrice);
+    }
+
+    for (const child of Object.values(value)) {
+      walk(child);
+    }
+  };
+
+  walk(payload);
+
+  return { byId, byNameQty };
+}
+
+function applyCheckoutPrices(items, priceMap) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return [];
+  }
+
+  const byId = priceMap && priceMap.byId instanceof Map ? priceMap.byId : new Map();
+  const byNameQty = priceMap && priceMap.byNameQty instanceof Map ? priceMap.byNameQty : new Map();
+
+  return items.map((item) => {
+    const normalizedName = cleanText(item.name || '').toLowerCase();
+    const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
+
+    const matchedPrice =
+      (item._itemId && byId.get(item._itemId)) ||
+      byNameQty.get(itemKey) ||
+      null;
+
+    return {
+      name: item.name,
+      quantity: item.quantity,
+      imageUrl: item.imageUrl || null,
+      priceText: matchedPrice || item.priceText || null,
+      notes: item.notes || null
+    };
+  });
+}
+
+async function addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
+  if (!draftOrderUUID) {
+    return {
+      attempted: false,
+      ok: false,
+      reason: 'missing-draft-order-uuid'
+    };
+  }
+
+  const requestHeaders = {
+    accept: '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'content-type': 'application/json',
+    'x-csrf-token': cookieMap.get('csrf_token') || 'x',
+    'x-uber-ciid': cookieMap.get('x-uber-ciid') || randomUUID(),
+    'x-uber-client-gitref': 'bd7681663ce1c75fe98231630f5e575b336e542d',
+    'x-uber-request-id': randomUUID(),
+    'x-uber-session-id': cookieMap.get('uev2.id.session') || randomUUID(),
+    referer: buildGroupOrderJoinReferer(sourceUrl, draftOrderUUID),
+    cookie: cookieHeader,
+    priority: 'u=1, i'
+  };
+
+  if (loc && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
+    requestHeaders['x-uber-target-location-latitude'] = String(loc.latitude);
+    requestHeaders['x-uber-target-location-longitude'] = String(loc.longitude);
+  }
+
+  try {
+    const response = await fetch('https://www.ubereats.com/_p/api/addMemberToDraftOrderV1', {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify({ draftOrderUuid: draftOrderUUID })
+    });
+
+    if (!response.ok) {
+      return {
+        attempted: true,
+        ok: false,
+        reason: `add-member-http-${response.status}`
+      };
+    }
+
+    return {
+      attempted: true,
+      ok: true,
+      reason: null
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function buildGroupOrderJoinReferer(sourceUrl, draftOrderUUID) {
+  try {
+    const parsed = new URL(sourceUrl);
+    return `${parsed.origin}/group-orders/${draftOrderUUID}/join?source=quickActionCopy`;
+  } catch {
+    return `https://www.ubereats.com/group-orders/${draftOrderUUID}/join?source=quickActionCopy`;
+  }
+}
+
+function extractDraftOrderUUID(sourceUrl, cookieHeader, html) {
   try {
     const parsed = new URL(sourceUrl);
     const match = parsed.pathname.match(/\/group-orders\/([0-9a-fA-F-]{16,})/i);
     if (match && match[1]) {
       return match[1];
     }
+
+    const directQueryKeys = ['draftOrderUUID', 'draft_order_uuid', 'groupOrderUUID', 'group_order_uuid', 'uev2.do'];
+    for (const key of directQueryKeys) {
+      const rawValue = parsed.searchParams.get(key);
+      const candidate = findUuidLikeText(rawValue);
+      if (candidate) {
+        return candidate;
+      }
+    }
   } catch {
     // Ignore URL parse failure and try cookie fallback.
   }
 
   const cookieMap = parseCookieMap(cookieHeader);
-  return cookieMap.get('uev2.do') || null;
+  const fromCookie = findUuidLikeText(cookieMap.get('uev2.do'));
+  if (fromCookie) {
+    return fromCookie;
+  }
+
+  return extractDraftOrderUUIDFromHtml(html);
+}
+
+function extractDraftOrderUUIDFromHtml(html) {
+  if (typeof html !== 'string' || !html) {
+    return null;
+  }
+
+  const patterns = [
+    /(draftOrderUUID|draft_order_uuid|uev2\.do)\"?\s*[:=]\s*\"?([0-9a-fA-F-]{16,})/i,
+    /(groupOrderUUID|group_order_uuid)\"?\s*[:=]\s*\"?([0-9a-fA-F-]{16,})/i,
+    /\/group-orders\/([0-9a-fA-F-]{16,})/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    const candidate = findUuidLikeText(match && (match[2] || match[1]));
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function findUuidLikeText(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const match = value.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+  if (match && match[0]) {
+    return match[0];
+  }
+
+  const fallback = value.match(/[0-9a-fA-F-]{16,}/);
+  return fallback && fallback[0] ? fallback[0] : null;
 }
 
 function parseCookieMap(cookieHeader) {
@@ -741,7 +1081,7 @@ function extractItemsFromDraftOrderPayload(payload) {
     }
 
     const quantity = parseQuantity(item.quantity);
-    const itemId = cleanText(item.shoppingCartItemUuid || item.uuid || '');
+    const itemId = cleanText(item.shoppingCartItemUuid || item.shoppingCartItemUUID || item.itemUuid || item.uuid || '');
     const key = itemId || `${name}::${quantity}`;
 
     let record = byKey.get(key);
@@ -749,7 +1089,12 @@ function extractItemsFromDraftOrderPayload(payload) {
       record = {
         name,
         quantity,
+        itemId: itemId || null,
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
+        priceText:
+          formatPrice(
+            item.totalPrice ?? item.price ?? item.unitPrice ?? item.subtotal ?? item.amount ?? item.priceInfo
+          ) || null,
         modifiers: new Set()
       };
       byKey.set(key, record);
@@ -757,6 +1102,19 @@ function extractItemsFromDraftOrderPayload(payload) {
       const candidateImageUrl = cleanText(item.imageURL || item.imageUrl || item.image_url || '');
       if (candidateImageUrl) {
         record.imageUrl = candidateImageUrl;
+      }
+    }
+
+    if (!record.itemId && itemId) {
+      record.itemId = itemId;
+    }
+
+    if (!record.priceText) {
+      const candidatePriceText = formatPrice(
+        item.totalPrice ?? item.price ?? item.unitPrice ?? item.subtotal ?? item.amount ?? item.priceInfo
+      );
+      if (candidatePriceText) {
+        record.priceText = candidatePriceText;
       }
     }
 
@@ -786,9 +1144,10 @@ function extractItemsFromDraftOrderPayload(payload) {
     return {
       name: entry.name,
       quantity: entry.quantity,
+      _itemId: entry.itemId || null,
       imageUrl: entry.imageUrl || null,
-      priceText: null,
-      notes: modifiers.length > 0 ? `Mods: ${modifiers.join(', ')} · From draft order API` : 'From draft order API'
+      priceText: entry.priceText || null,
+      notes: modifiers.length > 0 ? `Mods: ${modifiers.join(', ')}` : null
     };
   });
 }
