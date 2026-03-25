@@ -6,11 +6,18 @@ const HARDCODED_GROUP_COOKIE = "uev2.id.session_v2=cfa0cf3d-b0d2-414c-984b-011f3
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MIN_SUBTOTAL = parseMinimumSubtotal(process.env.MIN_SUBTOTAL, 20);
+
+app.disable('etag');
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Surrogate-Control', 'no-store');
 
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
@@ -19,7 +26,22 @@ app.use((req, res, next) => {
   return next();
 });
 
-app.use(express.static('public'));
+app.get('/app-config.js', (req, res) => {
+  res.type('application/javascript');
+  res.send(`window.APP_MIN_SUBTOTAL = ${MIN_SUBTOTAL};`);
+});
+
+app.use(express.static('public', {
+  etag: false,
+  lastModified: false,
+  maxAge: 0,
+  setHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+  }
+}));
 app.use(express.json({ limit: '200kb' }));
 
 app.get(['/api/group-order', '/api/group-orders'], async (req, res) => {
@@ -108,6 +130,8 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
         result.items = draftOrderFallback.items;
         result.itemCount = draftOrderFallback.items.length;
+        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
+        result.subtotalText = formatSubtotal(result.subtotal);
         result.diagnostics.draftOrderByUuidFallback.used = true;
         result.diagnostics.draftOrderByUuidFallback.reason = null;
       }
@@ -195,13 +219,24 @@ function extractOrderData(html, sourceUrl) {
     }
   }
 
+  const uniqueItems = Array.from(unique.values());
+  const publicItems = uniqueItems.map((item) => ({
+    name: item.name,
+    quantity: item.quantity,
+    priceText: item.priceText || null,
+    notes: item.notes || null
+  }));
+  const subtotal = calculateSubtotalFromItems(uniqueItems);
+
   return {
     sourceUrl,
     merchantName: extractionState.merchantName,
     deliveryAddress: extractionState.deliveryAddress,
     hostName: extractionState.hostName,
-    items: Array.from(unique.values()),
+    items: publicItems,
     itemCount: unique.size,
+    subtotal,
+    subtotalText: formatSubtotal(subtotal),
     diagnostics: {
       parsedJsonBlobs: parsedJsonBlobs.length,
       rawItemCandidates: extractionState.rawItemCandidates,
@@ -500,21 +535,99 @@ function normalizeItem(candidate) {
 
   const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
 
-  const priceCandidate =
-    candidate.price ??
-    candidate.totalPrice ??
-    candidate.unitPrice ??
-    candidate.subtotal ??
-    candidate.amount;
+  const selectedPrice = selectPriceCandidate(candidate);
+  const priceCandidate = selectedPrice.value;
 
   const priceText = formatPrice(priceCandidate);
+  const priceValue = parseMoneyToNumber(priceText);
 
   return {
     name,
     quantity,
     priceText,
+    _priceValue: Number.isFinite(priceValue) ? priceValue : null,
+    _isUnitPrice: selectedPrice.isUnitPrice,
     notes: readString('description', 'note', 'specialInstructions')
   };
+}
+
+function selectPriceCandidate(candidate) {
+  if (candidate.totalPrice != null) {
+    return { value: candidate.totalPrice, isUnitPrice: false };
+  }
+
+  if (candidate.subtotal != null) {
+    return { value: candidate.subtotal, isUnitPrice: false };
+  }
+
+  if (candidate.amount != null) {
+    return { value: candidate.amount, isUnitPrice: false };
+  }
+
+  if (candidate.price != null) {
+    return { value: candidate.price, isUnitPrice: false };
+  }
+
+  if (candidate.unitPrice != null) {
+    return { value: candidate.unitPrice, isUnitPrice: true };
+  }
+
+  return { value: null, isUnitPrice: false };
+}
+
+function calculateSubtotalFromItems(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return 0;
+  }
+
+  let subtotal = 0;
+  for (const item of items) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const parsedAmount = Number.isFinite(item._priceValue) ? item._priceValue : parseMoneyToNumber(item.priceText);
+    if (!Number.isFinite(parsedAmount)) {
+      continue;
+    }
+
+    const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
+    const lineAmount = item._isUnitPrice ? parsedAmount * quantity : parsedAmount;
+    subtotal += lineAmount;
+  }
+
+  return Number(subtotal.toFixed(2));
+}
+
+function formatSubtotal(amount) {
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+
+  return `$${amount.toFixed(2)}`;
+}
+
+function parseMoneyToNumber(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const cleaned = cleanText(value);
+  if (!cleaned) {
+    return null;
+  }
+
+  const match = cleaned.match(/-?\d[\d,]*(?:\.\d+)?/);
+  if (!match || !match[0]) {
+    return null;
+  }
+
+  const normalized = Number(match[0].replace(/,/g, ''));
+  return Number.isFinite(normalized) ? normalized : null;
 }
 
 function formatPrice(price) {
@@ -1035,6 +1148,15 @@ function parseLocationCookie(encodedValue) {
   } catch {
     return null;
   }
+}
+
+function parseMinimumSubtotal(rawValue, fallbackValue) {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallbackValue;
+  }
+
+  return Number(parsed.toFixed(2));
 }
 
 function extractItemsFromDraftOrderPayload(payload) {
