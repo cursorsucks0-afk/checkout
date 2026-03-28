@@ -126,10 +126,45 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
         result.items = draftOrderFallback.items;
         result.itemCount = draftOrderFallback.items.length;
-        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
-        result.subtotalText = formatSubtotal(result.subtotal);
+        const fallbackSubtotal = draftOrderFallback.checkoutSubtotal;
+        if (fallbackSubtotal && Number.isFinite(fallbackSubtotal.value)) {
+          result.subtotal = Number(fallbackSubtotal.value.toFixed(2));
+          result.subtotalText = fallbackSubtotal.formattedText || formatSubtotal(result.subtotal);
+          result.subtotalMode = 'auto';
+          result.hasCheckoutSubtotal = true;
+          result.checkoutSubtotalSource = fallbackSubtotal.source || 'getCheckoutPresentationV1';
+          result.diagnostics.checkoutSubtotalDetected = true;
+        } else {
+          result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
+          result.subtotalText = formatSubtotal(result.subtotal);
+        }
         result.diagnostics.draftOrderByUuidFallback.used = true;
         result.diagnostics.draftOrderByUuidFallback.reason = null;
+      }
+    }
+
+    // If checkout subtotal wasn't detected from page parsing, try the explicit checkout API payload once.
+    if (useAuthCookie && result.subtotalMode !== 'auto') {
+      const draftOrderUUID = extractDraftOrderUUID(resolvedUrl, effectiveCookie, html);
+      if (draftOrderUUID) {
+        const cookieMap = parseCookieMap(effectiveCookie);
+        const loc = parseLocationCookie(cookieMap.get('uev2.loc'));
+        const checkoutPresentation = await fetchCheckoutPresentationPriceMap(
+          resolvedUrl,
+          effectiveCookie,
+          draftOrderUUID,
+          cookieMap,
+          loc
+        );
+        const apiSubtotal = checkoutPresentation && checkoutPresentation.subtotal ? checkoutPresentation.subtotal : null;
+        if (apiSubtotal && Number.isFinite(apiSubtotal.value)) {
+          result.subtotal = Number(apiSubtotal.value.toFixed(2));
+          result.subtotalText = apiSubtotal.formattedText || formatSubtotal(result.subtotal);
+          result.subtotalMode = 'auto';
+          result.hasCheckoutSubtotal = true;
+          result.checkoutSubtotalSource = apiSubtotal.source || 'getCheckoutPresentationV1';
+          result.diagnostics.checkoutSubtotalDetected = true;
+        }
       }
     }
 
@@ -989,14 +1024,16 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
       ok: true,
       reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
       autoJoin,
-      items: pricedItems
+      items: pricedItems,
+      checkoutSubtotal: checkoutPrices && checkoutPrices.subtotal ? checkoutPrices.subtotal : null
     };
   } catch (error) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
       autoJoin,
-      items: []
+      items: [],
+      checkoutSubtotal: null
     };
   }
 }
@@ -1067,7 +1104,7 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     });
 
     if (!response.ok) {
-      return { byId: new Map(), byNameQty: new Map() };
+      return { byId: new Map(), byNameQty: new Map(), subtotal: null };
     }
 
     const text = await response.text();
@@ -1075,13 +1112,60 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     try {
       json = JSON.parse(text);
     } catch {
-      return { byId: new Map(), byNameQty: new Map() };
+      return { byId: new Map(), byNameQty: new Map(), subtotal: null };
     }
 
-    return extractCheckoutPriceMap(json);
+    const maps = extractCheckoutPriceMap(json);
+    const subtotal = extractCheckoutSubtotalFromPresentationPayload(json);
+    return {
+      byId: maps.byId,
+      byNameQty: maps.byNameQty,
+      subtotal
+    };
   } catch {
-    return { byId: new Map(), byNameQty: new Map() };
+    return { byId: new Map(), byNameQty: new Map(), subtotal: null };
   }
+}
+
+function extractCheckoutSubtotalFromPresentationPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const checkoutPayloads = findNestedObject(
+    payload,
+    (obj) => obj && typeof obj === 'object' && obj.checkoutPayloads && typeof obj.checkoutPayloads === 'object'
+  );
+  const source = checkoutPayloads && checkoutPayloads.checkoutPayloads ? checkoutPayloads.checkoutPayloads : null;
+  if (!source) {
+    return null;
+  }
+
+  const subtotalNode = source.subtotal && source.subtotal.subtotal ? source.subtotal.subtotal : null;
+  if (subtotalNode && typeof subtotalNode === 'object') {
+    const parsed = parseCheckoutSubtotalNode(subtotalNode);
+    if (Number.isFinite(parsed?.value)) {
+      return {
+        value: parsed.value,
+        formattedText: parsed.formattedText,
+        source: 'checkoutPayloads.subtotal.subtotal'
+      };
+    }
+  }
+
+  const totalNode = source.total && source.total.total ? source.total.total : null;
+  if (totalNode && typeof totalNode === 'object') {
+    const parsed = parseCheckoutSubtotalNode(totalNode);
+    if (Number.isFinite(parsed?.value)) {
+      return {
+        value: parsed.value,
+        formattedText: parsed.formattedText,
+        source: 'checkoutPayloads.total.total'
+      };
+    }
+  }
+
+  return null;
 }
 
 function extractCheckoutPriceMap(payload) {
