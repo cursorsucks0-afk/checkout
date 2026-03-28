@@ -8,6 +8,11 @@ const HARDCODED_GROUP_COOKIE = "uev2.id.session_v2=cfa0cf3d-b0d2-414c-984b-011f3
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const GROUP_ORDER_CACHE_TTL_MS = 20000;
+const GROUP_ORDER_CACHE_MAX_ENTRIES = 200;
+const PAGE_FETCH_TIMEOUT_MS = 10000;
+const API_FETCH_TIMEOUT_MS = 8000;
+const groupOrderResponseCache = new Map();
 
 app.disable('etag');
 
@@ -89,11 +94,26 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     };
   }
 
+  const cacheKey = buildGroupOrderCacheKey(parsed.toString());
+  const now = Date.now();
+  const cached = groupOrderResponseCache.get(cacheKey);
+  if (cached && (now - cached.cachedAt) < GROUP_ORDER_CACHE_TTL_MS) {
+    const clone = JSON.parse(JSON.stringify(cached.payload));
+    clone.diagnostics = clone.diagnostics || {};
+    clone.diagnostics.cacheHit = true;
+    clone.diagnostics.cachedAgeMs = now - cached.cachedAt;
+
+    return {
+      statusCode: 200,
+      data: clone
+    };
+  }
+
   try {
-    const response = await fetch(parsed.toString(), {
+    const response = await fetchWithTimeout(parsed.toString(), {
       headers: buildRequestHeaders(effectiveCookie),
       redirect: 'follow'
-    });
+    }, PAGE_FETCH_TIMEOUT_MS);
 
     const html = await response.text();
 
@@ -133,6 +153,8 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       }
     }
 
+    setCachedGroupOrderResponse(cacheKey, result);
+
     return {
       statusCode: 200,
       data: result
@@ -145,6 +167,62 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
         details: error instanceof Error ? error.message : String(error)
       }
     };
+  }
+}
+
+function buildGroupOrderCacheKey(inputUrl) {
+  try {
+    const parsed = new URL(inputUrl);
+    const significantParams = [
+      'draftOrderUUID',
+      'draft_order_uuid',
+      'groupOrderUUID',
+      'group_order_uuid',
+      'uev2.do'
+    ];
+    const filtered = new URLSearchParams();
+    for (const key of significantParams) {
+      const value = parsed.searchParams.get(key);
+      if (value) {
+        filtered.set(key, value);
+      }
+    }
+
+    const query = filtered.toString();
+    return `${parsed.origin}${parsed.pathname}${query ? `?${query}` : ''}`.toLowerCase();
+  } catch {
+    return String(inputUrl || '').trim().toLowerCase();
+  }
+}
+
+function setCachedGroupOrderResponse(cacheKey, payload) {
+  if (!cacheKey || !payload || typeof payload !== 'object') {
+    return;
+  }
+
+  if (groupOrderResponseCache.size >= GROUP_ORDER_CACHE_MAX_ENTRIES) {
+    const oldestKey = groupOrderResponseCache.keys().next().value;
+    if (oldestKey) {
+      groupOrderResponseCache.delete(oldestKey);
+    }
+  }
+
+  groupOrderResponseCache.set(cacheKey, {
+    cachedAt: Date.now(),
+    payload
+  });
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = API_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -811,7 +889,7 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
   const cookieMap = parseCookieMap(cookieHeader);
   const loc = parseLocationCookie(cookieMap.get('uev2.loc'));
 
-  const autoJoin = await addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc);
+  const autoJoinPromise = addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc);
 
   const requestHeaders = {
     accept: '*/*',
@@ -833,18 +911,18 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
   }
 
   try {
-    const response = await fetch('https://www.ubereats.com/_p/api/getDraftOrderByUuidV2', {
+    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/getDraftOrderByUuidV2', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify({ draftOrderUUID })
-    });
+    }, API_FETCH_TIMEOUT_MS);
 
     const text = await response.text();
     if (!response.ok) {
       return {
         ok: false,
         reason: `draft-order-http-${response.status}`,
-        autoJoin,
+        autoJoin: await autoJoinPromise,
         items: []
       };
     }
@@ -856,20 +934,36 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
       return {
         ok: false,
         reason: 'draft-order-invalid-json',
-        autoJoin,
+        autoJoin: await autoJoinPromise,
         items: []
       };
     }
 
     const extractedItems = extractItemsFromDraftOrderPayload(json);
-    const checkoutPrices = await fetchCheckoutPresentationPriceMap(
-      sourceUrl,
-      cookieHeader,
-      draftOrderUUID,
-      cookieMap,
-      loc
-    );
-    const pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
+
+    const shouldFetchCheckoutPrices = extractedItems.some((item) => {
+      if (!item || typeof item !== 'object') {
+        return true;
+      }
+      const hasLineValue = Number.isFinite(Number(item._lineTotalValue));
+      const hasUnitValue = Number.isFinite(Number(item._unitPriceValue));
+      const hasPriceText = Boolean(cleanText(item.priceText || ''));
+      return !(hasLineValue || hasUnitValue || hasPriceText);
+    });
+
+    let pricedItems = extractedItems;
+    if (shouldFetchCheckoutPrices) {
+      const checkoutPrices = await fetchCheckoutPresentationPriceMap(
+        sourceUrl,
+        cookieHeader,
+        draftOrderUUID,
+        cookieMap,
+        loc
+      );
+      pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
+    }
+
+    const autoJoin = await autoJoinPromise;
 
     return {
       ok: true,
@@ -881,7 +975,7 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
-      autoJoin,
+      autoJoin: await autoJoinPromise,
       items: []
     };
   }
@@ -911,30 +1005,8 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     payloadTypes: [
       'cartItems',
       'subtotal',
-      'basketSize',
-      'promotion',
-      'restrictedItems',
-      'venueSectionPicker',
-      'locationInfo',
-      'upsellCatalogSections',
       'subTotalFareBreakdown',
-      'canonicalProductStorePickerPayload',
-      'storeSwitcherActionableBannerPayload',
-      'fareBreakdown',
-      'promoAndMembershipSavingBannerPayload',
-      'passBanner',
-      'passBannerOnCartPayload',
-      'merchantMembership',
-      'giftInfo',
-      'total',
-      'paymentProfilesEligibility',
-      'requestUtensilPayload',
-      'upsellFeed',
-      'upfrontTipping',
-      'promoAndMembershipSavingBannerPayloadCheckout',
-      'deliveryOptInInfo',
-      'eta',
-      'orderConfirmations'
+      'total'
     ],
     draftOrderUUID,
     isGroupOrder: true,
@@ -946,11 +1018,11 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
   };
 
   try {
-    const response = await fetch('https://www.ubereats.com/_p/api/getCheckoutPresentationV1', {
+    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/getCheckoutPresentationV1', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify(requestBody)
-    });
+    }, API_FETCH_TIMEOUT_MS);
 
     if (!response.ok) {
       return { byId: new Map(), byNameQty: new Map() };
@@ -1093,11 +1165,11 @@ async function addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, co
   }
 
   try {
-    const response = await fetch('https://www.ubereats.com/_p/api/addMemberToDraftOrderV1', {
+    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/addMemberToDraftOrderV1', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify({ draftOrderUuid: draftOrderUUID })
-    });
+    }, API_FETCH_TIMEOUT_MS);
 
     if (!response.ok) {
       return {
