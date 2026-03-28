@@ -112,7 +112,7 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     const result = extractOrderData(html, resolvedUrl);
     result.diagnostics.authCookieProvided = useAuthCookie;
 
-    if (useAuthCookie && result.itemCount === 0) {
+    if (useAuthCookie) {
       const draftOrderFallback = await extractItemsWithDraftOrderByUuid(resolvedUrl, effectiveCookie, html);
       result.diagnostics.draftOrderByUuidFallback = {
         attempted: true,
