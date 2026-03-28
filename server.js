@@ -644,6 +644,15 @@ function calculateSubtotalFromItems(items) {
       continue;
     }
 
+    // Prefer explicit line totals when present so subtotal always matches rendered item totals.
+    const explicitLineTotal = Number.isFinite(item._lineTotalValue)
+      ? item._lineTotalValue
+      : parseMoneyToNumber(item._lineTotalText || item.lineTotalText || null);
+    if (Number.isFinite(explicitLineTotal)) {
+      subtotal += explicitLineTotal;
+      continue;
+    }
+
     const parsedAmount = Number.isFinite(item._priceValue) ? item._priceValue : parseMoneyToNumber(item.priceText);
     if (!Number.isFinite(parsedAmount)) {
       continue;
