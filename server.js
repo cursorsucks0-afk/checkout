@@ -874,15 +874,18 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
       loc
     );
     const pricedItems = applyCheckoutPrices(extractedItems, checkoutData.priceMap);
+    const computedSubtotal = calculateSubtotalFromItems(pricedItems);
+    const checkoutSubtotal = Number.isFinite(checkoutData.subtotal) ? Number(checkoutData.subtotal) : null;
+    const shouldTrustCheckoutSubtotal = Number.isFinite(checkoutSubtotal)
+      && Number.isFinite(computedSubtotal)
+      && Math.abs(checkoutSubtotal - computedSubtotal) <= 0.5;
 
     return {
       ok: true,
       reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
       autoJoin,
       items: pricedItems,
-      subtotal: Number.isFinite(checkoutData.subtotal)
-        ? checkoutData.subtotal
-        : calculateSubtotalFromItems(pricedItems)
+      subtotal: shouldTrustCheckoutSubtotal ? checkoutSubtotal : computedSubtotal
     };
   } catch (error) {
     return {
@@ -1121,10 +1124,9 @@ function applyCheckoutPrices(items, priceMap) {
     const normalizedName = cleanText(item.name || '').toLowerCase();
     const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
 
-    const matchedPriceRecord =
-      (item._itemId && byId.get(item._itemId)) ||
-      byNameQty.get(itemKey) ||
-      null;
+    // Name/qty matching is too noisy in large checkout payloads and can map wrong prices.
+    // Prefer strict cart-item UUID matching only.
+    const matchedPriceRecord = (item._itemId && byId.get(item._itemId)) || null;
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
@@ -1151,7 +1153,8 @@ function applyCheckoutPrices(items, priceMap) {
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       addOnsTotalText: addOnsTotalValue > 0 ? formatSubtotal(addOnsTotalValue) : null,
       addOnsTotalValue: addOnsTotalValue > 0 ? addOnsTotalValue : null,
-      notes: item.notes || null
+      notes: item.notes || null,
+      pricingSource: matchedPriceRecord ? 'checkout-by-id' : 'draft-order'
     };
   });
 }
