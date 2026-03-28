@@ -1,3 +1,5 @@
+
+// note this is just for refrence its not used via this project and is hosted via the checkout url
 const express = require('express');
 const cheerio = require('cheerio');
 const { randomUUID } = require('crypto');
@@ -6,7 +8,6 @@ const HARDCODED_GROUP_COOKIE = "uev2.id.session_v2=cfa0cf3d-b0d2-414c-984b-011f3
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MIN_SUBTOTAL = parseMinimumSubtotal(process.env.MIN_SUBTOTAL, 20);
 
 app.disable('etag');
 
@@ -24,11 +25,6 @@ app.use((req, res, next) => {
   }
 
   return next();
-});
-
-app.get('/app-config.js', (req, res) => {
-  res.type('application/javascript');
-  res.send(`window.APP_MIN_SUBTOTAL = ${MIN_SUBTOTAL};`);
 });
 
 app.use(express.static('public', {
@@ -224,6 +220,12 @@ function extractOrderData(html, sourceUrl) {
     name: item.name,
     quantity: item.quantity,
     priceText: item.priceText || null,
+    isUnitPrice: item._isUnitPrice !== false,
+    unitPriceText: item._unitPriceText || null,
+    lineTotalText: item._lineTotalText || item.priceText || null,
+    unitPriceValue: Number.isFinite(item._unitPriceValue) ? item._unitPriceValue : null,
+    lineTotalValue: Number.isFinite(item._lineTotalValue) ? item._lineTotalValue : null,
+    imageUrl: item.imageUrl || null,
     notes: item.notes || null
   }));
   const subtotal = calculateSubtotalFromItems(uniqueItems);
@@ -540,13 +542,22 @@ function normalizeItem(candidate) {
 
   const priceText = formatPrice(priceCandidate);
   const priceValue = parseMoneyToNumber(priceText);
+  const isUnitPrice = selectedPrice.isUnitPrice !== false;
+  const unitPriceValue = Number.isFinite(priceValue) ? priceValue : null;
+  const lineTotalValue = Number.isFinite(priceValue)
+    ? Number(((isUnitPrice ? priceValue * quantity : priceValue)).toFixed(2))
+    : null;
 
   return {
     name,
     quantity,
     priceText,
-    _priceValue: Number.isFinite(priceValue) ? priceValue : null,
-    _isUnitPrice: selectedPrice.isUnitPrice,
+    _priceValue: unitPriceValue,
+    _isUnitPrice: isUnitPrice,
+    _unitPriceValue: unitPriceValue,
+    _lineTotalValue: lineTotalValue,
+    _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : priceText,
+    _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : priceText,
     notes: readString('description', 'note', 'specialInstructions')
   };
 }
@@ -561,11 +572,11 @@ function selectPriceCandidate(candidate) {
   }
 
   if (candidate.amount != null) {
-    return { value: candidate.amount, isUnitPrice: false };
+    return { value: candidate.amount, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.amount) };
   }
 
   if (candidate.price != null) {
-    return { value: candidate.price, isUnitPrice: false };
+    return { value: candidate.price, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.price) };
   }
 
   if (candidate.unitPrice != null) {
@@ -573,6 +584,53 @@ function selectPriceCandidate(candidate) {
   }
 
   return { value: null, isUnitPrice: false };
+}
+
+function inferUnitPriceFromCandidate(candidate, rawPrice) {
+  const quantityRaw =
+    candidate.quantity ??
+    candidate.qty ??
+    candidate.count ??
+    candidate.itemQuantity ??
+    candidate.units ??
+    candidate.numItems;
+  const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
+
+  const explicitTotalKeys = [
+    'lineTotal',
+    'lineAmount',
+    'extendedPrice',
+    'itemTotal',
+    'total',
+    'subtotal'
+  ];
+
+  for (const key of explicitTotalKeys) {
+    if (candidate[key] != null) {
+      return false;
+    }
+  }
+
+  const normalizedText = String(
+    (rawPrice && typeof rawPrice === 'object' && (rawPrice.displayString || rawPrice.formattedPrice || rawPrice.displayPrice))
+      || rawPrice
+      || ''
+  ).toLowerCase();
+
+  if (normalizedText.includes('each') || normalizedText.includes('ea')) {
+    return true;
+  }
+
+  if (normalizedText.includes('total') || normalizedText.includes('subtotal')) {
+    return false;
+  }
+
+  // Generic price fields on item records are most often unit prices.
+  if (quantity > 1) {
+    return true;
+  }
+
+  return true;
 }
 
 function calculateSubtotalFromItems(items) {
@@ -926,10 +984,9 @@ function extractCheckoutPriceMap(payload) {
     const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
     const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
     const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
-    const candidatePrice =
-      formatPrice(
-        value.totalPrice ?? value.price ?? value.unitPrice ?? value.subtotal ?? value.amount ?? value.priceInfo
-      ) || null;
+    const selected = selectPriceCandidate(value);
+    const candidatePrice = formatPrice(selected.value) || null;
+    const candidateIsUnit = selected.isUnitPrice !== false;
     const candidateId = cleanText(
       value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
     );
@@ -937,12 +994,12 @@ function extractCheckoutPriceMap(payload) {
     if (candidatePrice && candidateName) {
       const key = `${candidateName.toLowerCase()}::${candidateQty}`;
       if (!byNameQty.has(key)) {
-        byNameQty.set(key, candidatePrice);
+        byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
       }
     }
 
     if (candidatePrice && candidateId && !byId.has(candidateId)) {
-      byId.set(candidateId, candidatePrice);
+      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
     }
 
     for (const child of Object.values(value)) {
@@ -967,16 +1024,32 @@ function applyCheckoutPrices(items, priceMap) {
     const normalizedName = cleanText(item.name || '').toLowerCase();
     const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
 
-    const matchedPrice =
+    const matchedPriceRecord =
       (item._itemId && byId.get(item._itemId)) ||
       byNameQty.get(itemKey) ||
       null;
+    const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+      ? matchedPriceRecord.priceText
+      : matchedPriceRecord;
+    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+      ? matchedPriceRecord.isUnitPrice !== false
+      : item._isUnitPrice !== false;
+    const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
+    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
+    const lineTotalValue = Number.isFinite(unitPriceValue)
+      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
+      : null;
 
     return {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
       priceText: matchedPrice || item.priceText || null,
+      isUnitPrice,
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
+      unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
+      lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       notes: item.notes || null
     };
   });
@@ -1150,15 +1223,6 @@ function parseLocationCookie(encodedValue) {
   }
 }
 
-function parseMinimumSubtotal(rawValue, fallbackValue) {
-  const parsed = Number(rawValue);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return fallbackValue;
-  }
-
-  return Number(parsed.toFixed(2));
-}
-
 function extractItemsFromDraftOrderPayload(payload) {
   const draftOrder = payload && payload.data && payload.data.draftOrder;
   const shoppingCart = draftOrder && draftOrder.shoppingCart;
@@ -1225,12 +1289,18 @@ function extractItemsFromDraftOrderPayload(payload) {
         quantity,
         itemId: itemId || null,
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
-        priceText:
-          formatPrice(
-            item.totalPrice ?? item.price ?? item.unitPrice ?? item.subtotal ?? item.amount ?? item.priceInfo
-          ) || null,
+        priceText: null,
+        isUnitPrice: true,
         modifiers: new Set()
       };
+
+      const selected = selectPriceCandidate(item);
+      const selectedPriceText = formatPrice(selected.value) || null;
+      if (selectedPriceText) {
+        record.priceText = selectedPriceText;
+        record.isUnitPrice = selected.isUnitPrice !== false;
+      }
+
       byKey.set(key, record);
     } else if (!record.imageUrl) {
       const candidateImageUrl = cleanText(item.imageURL || item.imageUrl || item.image_url || '');
@@ -1244,11 +1314,11 @@ function extractItemsFromDraftOrderPayload(payload) {
     }
 
     if (!record.priceText) {
-      const candidatePriceText = formatPrice(
-        item.totalPrice ?? item.price ?? item.unitPrice ?? item.subtotal ?? item.amount ?? item.priceInfo
-      );
+      const selected = selectPriceCandidate(item);
+      const candidatePriceText = formatPrice(selected.value);
       if (candidatePriceText) {
         record.priceText = candidatePriceText;
+        record.isUnitPrice = selected.isUnitPrice !== false;
       }
     }
 
@@ -1275,12 +1345,22 @@ function extractItemsFromDraftOrderPayload(payload) {
 
   return Array.from(byKey.values()).map((entry) => {
     const modifiers = Array.from(entry.modifiers.values());
+    const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
+    const unitPriceValue = parseMoneyToNumber(entry.priceText);
+    const lineTotalValue = Number.isFinite(unitPriceValue)
+      ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
+      : null;
     return {
       name: entry.name,
-      quantity: entry.quantity,
+      quantity,
       _itemId: entry.itemId || null,
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
+      _isUnitPrice: entry.isUnitPrice !== false,
+      _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
+      _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
+      _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
+      _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (entry.priceText || null),
       notes: modifiers.length > 0 ? `Mods: ${modifiers.join(', ')}` : null
     };
   });
