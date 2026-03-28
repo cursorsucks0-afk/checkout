@@ -126,7 +126,9 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
         result.items = draftOrderFallback.items;
         result.itemCount = draftOrderFallback.items.length;
-        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
+        result.subtotal = Number.isFinite(draftOrderFallback.subtotal)
+          ? draftOrderFallback.subtotal
+          : calculateSubtotalFromItems(draftOrderFallback.items);
         result.subtotalText = formatSubtotal(result.subtotal);
         result.diagnostics.draftOrderByUuidFallback.used = true;
         result.diagnostics.draftOrderByUuidFallback.reason = null;
@@ -862,32 +864,36 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
     }
 
     const extractedItems = extractItemsFromDraftOrderPayload(json);
-    const checkoutPrices = await fetchCheckoutPresentationPriceMap(
+    const checkoutData = await fetchCheckoutPresentationData(
       sourceUrl,
       cookieHeader,
       draftOrderUUID,
       cookieMap,
       loc
     );
-    const pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
+    const pricedItems = applyCheckoutPrices(extractedItems, checkoutData.priceMap);
 
     return {
       ok: true,
       reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
       autoJoin,
-      items: pricedItems
+      items: pricedItems,
+      subtotal: Number.isFinite(checkoutData.subtotal)
+        ? checkoutData.subtotal
+        : calculateSubtotalFromItems(pricedItems)
     };
   } catch (error) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
       autoJoin,
-      items: []
+      items: [],
+      subtotal: null
     };
   }
 }
 
-async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
+async function fetchCheckoutPresentationData(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
   const requestHeaders = {
     accept: '*/*',
     'accept-language': 'en-US,en;q=0.9',
@@ -953,7 +959,10 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     });
 
     if (!response.ok) {
-      return { byId: new Map(), byNameQty: new Map() };
+      return {
+        priceMap: { byId: new Map(), byNameQty: new Map() },
+        subtotal: null
+      };
     }
 
     const text = await response.text();
@@ -961,13 +970,90 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     try {
       json = JSON.parse(text);
     } catch {
-      return { byId: new Map(), byNameQty: new Map() };
+      return {
+        priceMap: { byId: new Map(), byNameQty: new Map() },
+        subtotal: null
+      };
     }
 
-    return extractCheckoutPriceMap(json);
+    return {
+      priceMap: extractCheckoutPriceMap(json),
+      subtotal: extractCheckoutSubtotal(json)
+    };
   } catch {
-    return { byId: new Map(), byNameQty: new Map() };
+    return {
+      priceMap: { byId: new Map(), byNameQty: new Map() },
+      subtotal: null
+    };
   }
+}
+
+function extractCheckoutSubtotal(payload) {
+  const candidates = [];
+
+  const pushCandidate = (rawValue, weight, path) => {
+    const parsed = parseMoneyToNumber(formatPrice(rawValue) || rawValue);
+    if (!Number.isFinite(parsed)) {
+      return;
+    }
+    if (parsed < 0 || parsed > 20000) {
+      return;
+    }
+    candidates.push({ value: Number(parsed.toFixed(2)), weight, path: String(path || '') });
+  };
+
+  const walk = (value, path = '') => {
+    if (!value) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach((entry, idx) => walk(entry, `${path}[${idx}]`));
+      return;
+    }
+
+    if (typeof value !== 'object') {
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      const keyLower = String(key).toLowerCase();
+      const nextPath = path ? `${path}.${key}` : key;
+
+      if (keyLower === 'subtotal' || keyLower === 'sub_total' || keyLower === 'subtotalamount') {
+        pushCandidate(child, 100, nextPath);
+      }
+
+      if (typeof child === 'string' && keyLower.includes('subtotal')) {
+        pushCandidate(child, 70, nextPath);
+      }
+
+      if (child && typeof child === 'object') {
+        if (keyLower.includes('subtotal')) {
+          if (child.amount != null) pushCandidate(child.amount, 90, `${nextPath}.amount`);
+          if (child.value != null) pushCandidate(child.value, 90, `${nextPath}.value`);
+          if (child.displayString != null) pushCandidate(child.displayString, 80, `${nextPath}.displayString`);
+          if (child.formattedPrice != null) pushCandidate(child.formattedPrice, 80, `${nextPath}.formattedPrice`);
+          if (child.displayPrice != null) pushCandidate(child.displayPrice, 80, `${nextPath}.displayPrice`);
+        }
+
+        walk(child, nextPath);
+      }
+    }
+  };
+
+  walk(payload);
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    return b.value - a.value;
+  });
+
+  return candidates[0].value;
 }
 
 function extractCheckoutPriceMap(payload) {
