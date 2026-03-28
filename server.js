@@ -126,10 +126,8 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
         result.items = draftOrderFallback.items;
         result.itemCount = draftOrderFallback.items.length;
-        result.subtotal = Number.isFinite(draftOrderFallback.subtotal)
-          ? draftOrderFallback.subtotal
-          : calculateSubtotalFromItems(draftOrderFallback.items);
-        result.subtotalText = formatSubtotal(result.subtotal);
+        result.subtotal = Number.isFinite(draftOrderFallback.subtotal) ? draftOrderFallback.subtotal : null;
+        result.subtotalText = Number.isFinite(result.subtotal) ? formatSubtotal(result.subtotal) : null;
         result.diagnostics.draftOrderByUuidFallback.used = true;
         result.diagnostics.draftOrderByUuidFallback.reason = null;
       }
@@ -794,6 +792,20 @@ function normalizeItemNameKey(value) {
     .trim();
 }
 
+function normalizeUuidLike(value) {
+  if (value == null) {
+    return null;
+  }
+
+  const raw = cleanText(String(value));
+  if (!raw) {
+    return null;
+  }
+
+  const match = raw.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+  return match && match[0] ? match[0].toLowerCase() : null;
+}
+
 function buildRequestHeaders(cookieHeader) {
   const headers = {
     'user-agent':
@@ -1085,6 +1097,51 @@ function extractCheckoutPriceMap(payload) {
   const byNameQty = new Map();
   const ambiguousNameQtyKeys = new Set();
 
+  const extractCandidateIds = (candidate) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return [];
+    }
+
+    const ids = new Set();
+    const directIdKeys = [
+      'shoppingCartItemUuid',
+      'shoppingCartItemUUID',
+      'shopping_cart_item_uuid',
+      'cartItemUuid',
+      'cartItemUUID',
+      'cart_item_uuid',
+      'lineItemUuid',
+      'lineItemUUID',
+      'line_item_uuid',
+      'itemUuid',
+      'itemUUID',
+      'item_uuid',
+      'uuid'
+    ];
+
+    for (const key of directIdKeys) {
+      const normalized = normalizeUuidLike(candidate[key]);
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+
+    for (const [key, val] of Object.entries(candidate)) {
+      if (typeof val !== 'string') {
+        continue;
+      }
+      if (!/(uuid|id)/i.test(key) || !/(item|cart|line)/i.test(key)) {
+        continue;
+      }
+      const normalized = normalizeUuidLike(val);
+      if (normalized) {
+        ids.add(normalized);
+      }
+    }
+
+    return Array.from(ids);
+  };
+
   const selectCheckoutPriceForMap = (candidate, hasItemId) => {
     if (!candidate || typeof candidate !== 'object') {
       return null;
@@ -1143,10 +1200,8 @@ function extractCheckoutPriceMap(payload) {
     const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
     const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
     const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
-    const candidateId = cleanText(
-      value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
-    );
-    const selectedForMap = selectCheckoutPriceForMap(value, Boolean(candidateId));
+    const candidateIds = extractCandidateIds(value);
+    const selectedForMap = selectCheckoutPriceForMap(value, candidateIds.length > 0);
     const candidatePrice = selectedForMap && selectedForMap.priceText ? selectedForMap.priceText : null;
     const candidateIsUnit = selectedForMap ? selectedForMap.isUnitPrice !== false : true;
     const candidateSource = selectedForMap ? selectedForMap.source : null;
@@ -1166,8 +1221,12 @@ function extractCheckoutPriceMap(payload) {
       }
     }
 
-    if (candidatePrice && candidateId && !byId.has(candidateId)) {
-      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+    if (candidatePrice && candidateIds.length > 0) {
+      for (const candidateId of candidateIds) {
+        if (!byId.has(candidateId)) {
+          byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+        }
+      }
     }
 
     for (const child of Object.values(value)) {
@@ -1192,7 +1251,8 @@ function applyCheckoutPrices(items, priceMap) {
     const normalizedNameKey = normalizeItemNameKey(item.name || '');
 
     // Strict mode: only trust checkout cart-item UUID matches.
-    const matchedById = (item._itemId && byId.get(item._itemId)) || null;
+    const normalizedItemId = normalizeUuidLike(item._itemId);
+    const matchedById = (normalizedItemId && byId.get(normalizedItemId)) || null;
     const matchedPriceRecord = matchedById || null;
 
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
@@ -1233,6 +1293,8 @@ function applyCheckoutPrices(items, priceMap) {
       notes: item.notes || null,
       pricingSource: matchedById ? 'checkout-by-id' : 'unmatched-no-authoritative-price',
       pricingDebug: {
+        itemId: normalizedItemId,
+        checkoutIdMapSize: byId.size,
         quantity,
         normalizedName,
         normalizedNameKey,
