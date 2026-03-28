@@ -1507,7 +1507,16 @@ function extractItemsFromDraftOrderPayload(payload) {
         if (hasSelectedQty) {
           normalizedQty = selectedQty;
         } else if (hasPositiveFallbackQty) {
-          normalizedQty = fallbackQty;
+          const leadingQtyMatch = optionName.match(/^(\d+)\b/);
+          const leadingQty = leadingQtyMatch && leadingQtyMatch[1] ? Number(leadingQtyMatch[1]) : null;
+
+          // Generic quantity fields can represent constraints (e.g., max allowed), not selected count.
+          // Only trust fallback qty > 1 when the option label itself carries the same explicit count.
+          if (fallbackQty > 1 && (!Number.isFinite(leadingQty) || leadingQty !== fallbackQty)) {
+            normalizedQty = 1;
+          } else {
+            normalizedQty = fallbackQty;
+          }
         }
 
         const selected = selectPriceCandidate(option);
@@ -1523,6 +1532,7 @@ function extractItemsFromDraftOrderPayload(payload) {
 
         details.push({
           key: `${optionName.toLowerCase()}::${normalizedQty}::${priceText || ''}`,
+          optionName,
           label,
           linePriceValue
         });
@@ -1590,6 +1600,26 @@ function extractItemsFromDraftOrderPayload(payload) {
 
     for (const modifier of collectCustomizationDetails(item)) {
       if (!modifier || !modifier.key || record.modifierKeys.has(modifier.key)) {
+        continue;
+      }
+
+      const modifierName = cleanText(modifier.optionName || '').toLowerCase();
+      const baseName = cleanText(record.name || '').toLowerCase();
+      const recordPriceValue = parseMoneyToNumber(record.priceText);
+      const baseIsUnsetOrZero = !Number.isFinite(recordPriceValue) || recordPriceValue <= 0;
+      const looksLikeEmbeddedBasePrice =
+        baseIsUnsetOrZero
+        && modifierName
+        && baseName
+        && modifierName === baseName
+        && Number.isFinite(modifier.linePriceValue)
+        && modifier.linePriceValue > 0;
+
+      if (looksLikeEmbeddedBasePrice) {
+        const qtyForUnit = Number.isFinite(Number(record.quantity)) && Number(record.quantity) > 0 ? Number(record.quantity) : 1;
+        const inferredUnitPrice = Number((modifier.linePriceValue / qtyForUnit).toFixed(2));
+        record.priceText = formatSubtotal(inferredUnitPrice);
+        record.isUnitPrice = true;
         continue;
       }
 
