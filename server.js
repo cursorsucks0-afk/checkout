@@ -1358,14 +1358,18 @@ function extractItemsFromDraftOrderPayload(payload) {
         }
 
         const optionName = cleanText(option.title || option.name || option.label || '');
-        const optionQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
+        const optionQtyRaw =
+          option.selectedQuantity
+          ?? option.selectedQty
+          ?? option.quantity
+          ?? option.qty
+          ?? option.count
+          ?? null;
         const optionQty = Number(optionQtyRaw);
         const isExplicitlySelected = Boolean(
           option.selected === true
           || option.isSelected === true
-          || option.checked === true
-          || option.chosen === true
-          || option.active === true
+          || option.is_checked === true
         );
         const hasPositiveQty = Number.isFinite(optionQty) && optionQty > 0;
 
@@ -1373,7 +1377,7 @@ function extractItemsFromDraftOrderPayload(payload) {
           continue;
         }
 
-        // Some payloads include full option catalogs; only count selected options.
+        // Some payloads include full option catalogs; only count clearly selected options.
         if (!isExplicitlySelected && !hasPositiveQty) {
           continue;
         }
