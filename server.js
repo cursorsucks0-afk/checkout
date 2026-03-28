@@ -1066,6 +1066,45 @@ function extractCheckoutPriceMap(payload) {
   const byNameQty = new Map();
   const ambiguousNameQtyKeys = new Set();
 
+  const selectCheckoutPriceForMap = (candidate, hasItemId) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return null;
+    }
+
+    // Name/qty fallback should only use direct item price-like fields.
+    if (candidate.unitPrice != null) {
+      return { priceText: formatPrice(candidate.unitPrice), isUnitPrice: true, source: 'unitPrice' };
+    }
+
+    if (candidate.price != null) {
+      return {
+        priceText: formatPrice(candidate.price),
+        isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.price),
+        source: 'price'
+      };
+    }
+
+    if (candidate.amount != null) {
+      return {
+        priceText: formatPrice(candidate.amount),
+        isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.amount),
+        source: 'amount'
+      };
+    }
+
+    // For strict UUID matches we can still use broader fallback candidate extraction.
+    if (hasItemId) {
+      const selected = selectPriceCandidate(candidate);
+      return {
+        priceText: formatPrice(selected.value),
+        isUnitPrice: selected.isUnitPrice !== false,
+        source: 'fallback'
+      };
+    }
+
+    return null;
+  };
+
   const walk = (value) => {
     if (!value) {
       return;
@@ -1085,14 +1124,15 @@ function extractCheckoutPriceMap(payload) {
     const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
     const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
     const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
-    const selected = selectPriceCandidate(value);
-    const candidatePrice = formatPrice(selected.value) || null;
-    const candidateIsUnit = selected.isUnitPrice !== false;
     const candidateId = cleanText(
       value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
     );
+    const selectedForMap = selectCheckoutPriceForMap(value, Boolean(candidateId));
+    const candidatePrice = selectedForMap && selectedForMap.priceText ? selectedForMap.priceText : null;
+    const candidateIsUnit = selectedForMap ? selectedForMap.isUnitPrice !== false : true;
+    const candidateSource = selectedForMap ? selectedForMap.source : null;
 
-    if (candidatePrice && candidateName) {
+    if (candidatePrice && candidateName && candidateSource !== 'fallback') {
       const key = `${candidateName.toLowerCase()}::${candidateQty}`;
       if (ambiguousNameQtyKeys.has(key)) {
         // Keep ambiguous keys disabled.
@@ -1132,25 +1172,46 @@ function applyCheckoutPrices(items, priceMap) {
 
     // Prefer strict cart-item UUID matching; fallback to unambiguous name+qty when needed.
     const matchedById = (item._itemId && byId.get(item._itemId)) || null;
-    const matchedByNameQty = byNameQty.get(itemKey) || null;
-    const matchedPriceRecord = matchedById || matchedByNameQty || null;
-    const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
-      ? matchedPriceRecord.priceText
-      : matchedPriceRecord;
-    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
-      ? matchedPriceRecord.isUnitPrice !== false
-      : item._isUnitPrice !== false;
+    const initialMatchedByNameQty = byNameQty.get(itemKey) || null;
+    let matchedByNameQty = initialMatchedByNameQty;
+    let matchedPriceRecord = matchedById || matchedByNameQty || null;
+
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
     const rawAddOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
 
     const draftUnitPriceValue = parseMoneyToNumber(item.priceText);
     const draftBaseLineValue = Number.isFinite(draftUnitPriceValue)
       ? Number(((item._isUnitPrice !== false ? draftUnitPriceValue * quantity : draftUnitPriceValue)).toFixed(2))
       : null;
-    const matchedLineValue = Number.isFinite(unitPriceValue)
+
+    let matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+      ? matchedPriceRecord.priceText
+      : matchedPriceRecord;
+    let isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+      ? matchedPriceRecord.isUnitPrice !== false
+      : item._isUnitPrice !== false;
+    let unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
+    let matchedLineValue = Number.isFinite(unitPriceValue)
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
+
+    // Guardrail: name/qty fallback can occasionally latch onto subtotal-like values.
+    if (!matchedById && matchedByNameQty && Number.isFinite(draftBaseLineValue) && Number.isFinite(matchedLineValue)) {
+      const expectedWithAddOns = Number((draftBaseLineValue + rawAddOnsTotalValue).toFixed(2));
+      const isLargeAbsoluteJump = matchedLineValue - expectedWithAddOns >= 12;
+      const isLargeRelativeJump = expectedWithAddOns > 0 && (matchedLineValue / expectedWithAddOns) >= 2.2;
+
+      if (isLargeAbsoluteJump || isLargeRelativeJump) {
+        matchedByNameQty = null;
+        matchedPriceRecord = matchedById || null;
+        matchedPrice = item.priceText || null;
+        isUnitPrice = item._isUnitPrice !== false;
+        unitPriceValue = parseMoneyToNumber(item.priceText);
+        matchedLineValue = Number.isFinite(unitPriceValue)
+          ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
+          : null;
+      }
+    }
 
     // Checkout price can be either base-only or already include modifiers depending on payload shape.
     // If matched line is near draft base line, keep draft add-ons; otherwise assume checkout already includes them.
@@ -1185,6 +1246,7 @@ function applyCheckoutPrices(items, priceMap) {
         quantity,
         matchedById: Boolean(matchedById),
         matchedByNameQty: Boolean(matchedByNameQty),
+        matchedByNameQtyInitially: Boolean(initialMatchedByNameQty),
         matchedPriceText: matchedPrice || null,
         draftPriceText: item.priceText || null,
         draftBaseLineValue: Number.isFinite(draftBaseLineValue) ? draftBaseLineValue : null,
