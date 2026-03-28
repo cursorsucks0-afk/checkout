@@ -227,6 +227,8 @@ function extractOrderData(html, sourceUrl) {
     lineTotalText: item._lineTotalText || item.priceText || null,
     unitPriceValue: Number.isFinite(item._unitPriceValue) ? item._unitPriceValue : null,
     lineTotalValue: Number.isFinite(item._lineTotalValue) ? item._lineTotalValue : null,
+    addOnsTotalText: Number.isFinite(item._addOnsTotalValue) ? formatSubtotal(item._addOnsTotalValue) : null,
+    addOnsTotalValue: Number.isFinite(item._addOnsTotalValue) ? item._addOnsTotalValue : null,
     imageUrl: item.imageUrl || null,
     notes: item.notes || null
   }));
@@ -1131,9 +1133,10 @@ function applyCheckoutPrices(items, priceMap) {
       : item._isUnitPrice !== false;
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
+    const addOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
     const lineTotalValue = Number.isFinite(unitPriceValue)
-      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
-      : null;
+      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
+      : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
 
     return {
       name: item.name,
@@ -1145,6 +1148,8 @@ function applyCheckoutPrices(items, priceMap) {
       lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
+      addOnsTotalText: addOnsTotalValue > 0 ? formatSubtotal(addOnsTotalValue) : null,
+      addOnsTotalValue: addOnsTotalValue > 0 ? addOnsTotalValue : null,
       notes: item.notes || null
     };
   });
@@ -1332,10 +1337,10 @@ function extractItemsFromDraftOrderPayload(payload) {
     return Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : 1;
   };
 
-  const collectCustomizationNames = (item) => {
-    const names = [];
+  const collectCustomizationDetails = (item) => {
+    const details = [];
     if (!item || typeof item !== 'object' || !item.customizations || typeof item.customizations !== 'object') {
-      return names;
+      return details;
     }
 
     for (const entry of Object.values(item.customizations)) {
@@ -1356,11 +1361,27 @@ function extractItemsFromDraftOrderPayload(payload) {
           continue;
         }
 
-        names.push(optionName);
+        const normalizedQty = Number.isFinite(optionQty) && optionQty > 0 ? optionQty : 1;
+        const selected = selectPriceCandidate(option);
+        const priceText = formatPrice(selected.value) || null;
+        const unitPriceValue = parseMoneyToNumber(priceText);
+        const linePriceValue = Number.isFinite(unitPriceValue)
+          ? Number((unitPriceValue * normalizedQty).toFixed(2))
+          : null;
+
+        const label = Number.isFinite(linePriceValue)
+          ? `${optionName} (+${formatSubtotal(linePriceValue)})`
+          : optionName;
+
+        details.push({
+          key: `${optionName.toLowerCase()}::${normalizedQty}::${priceText || ''}`,
+          label,
+          linePriceValue
+        });
       }
     }
 
-    return names;
+    return details;
   };
 
   const addBaseItem = (item) => {
@@ -1386,7 +1407,9 @@ function extractItemsFromDraftOrderPayload(payload) {
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
         isUnitPrice: true,
-        modifiers: new Set()
+        modifiers: new Set(),
+        modifierKeys: new Set(),
+        addOnsTotalValue: 0
       };
 
       const selected = selectPriceCandidate(item);
@@ -1417,8 +1440,16 @@ function extractItemsFromDraftOrderPayload(payload) {
       }
     }
 
-    for (const modifier of collectCustomizationNames(item)) {
-      record.modifiers.add(modifier);
+    for (const modifier of collectCustomizationDetails(item)) {
+      if (!modifier || !modifier.key || record.modifierKeys.has(modifier.key)) {
+        continue;
+      }
+
+      record.modifierKeys.add(modifier.key);
+      record.modifiers.add(modifier.label);
+      if (Number.isFinite(modifier.linePriceValue)) {
+        record.addOnsTotalValue = Number((record.addOnsTotalValue + modifier.linePriceValue).toFixed(2));
+      }
     }
   };
 
@@ -1442,9 +1473,13 @@ function extractItemsFromDraftOrderPayload(payload) {
     const modifiers = Array.from(entry.modifiers.values());
     const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(entry.priceText);
-    const lineTotalValue = Number.isFinite(unitPriceValue)
+    const baseLineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
+    const addOnsTotalValue = Number.isFinite(entry.addOnsTotalValue) ? entry.addOnsTotalValue : 0;
+    const lineTotalValue = Number.isFinite(baseLineTotalValue)
+      ? Number((baseLineTotalValue + addOnsTotalValue).toFixed(2))
+      : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
     return {
       name: entry.name,
       quantity,
@@ -1453,6 +1488,7 @@ function extractItemsFromDraftOrderPayload(payload) {
       priceText: entry.priceText || null,
       _isUnitPrice: entry.isUnitPrice !== false,
       _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
+      _addOnsTotalValue: addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null,
       _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
       _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (entry.priceText || null),
