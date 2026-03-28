@@ -888,16 +888,23 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
     const pricedItems = applyCheckoutPrices(extractedItems, checkoutData.priceMap);
     const computedSubtotal = calculateSubtotalFromItems(pricedItems);
     const checkoutSubtotal = Number.isFinite(checkoutData.subtotal) ? Number(checkoutData.subtotal) : null;
+    const allItemsAuthoritative = pricedItems.length > 0 && pricedItems.every((item) => item && item.pricingSource === 'checkout-by-id');
+    const allItemsHaveLineTotals = allItemsAuthoritative
+      && pricedItems.every((item) => Number.isFinite(item && item.lineTotalValue));
     const shouldTrustCheckoutSubtotal = Number.isFinite(checkoutSubtotal)
+      && allItemsAuthoritative
+      && allItemsHaveLineTotals
       && Number.isFinite(computedSubtotal)
-      && Math.abs(checkoutSubtotal - computedSubtotal) <= 0.5;
+      && Math.abs(checkoutSubtotal - computedSubtotal) <= 0.01;
 
     return {
       ok: true,
-      reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
+      reason: pricedItems.length > 0
+        ? (allItemsAuthoritative ? null : 'strict-pricing-unmatched-items')
+        : 'draft-order-no-item-names',
       autoJoin,
       items: pricedItems,
-      subtotal: shouldTrustCheckoutSubtotal ? checkoutSubtotal : computedSubtotal
+      subtotal: shouldTrustCheckoutSubtotal ? checkoutSubtotal : null
     };
   } catch (error) {
     return {
@@ -1179,26 +1186,16 @@ function applyCheckoutPrices(items, priceMap) {
   }
 
   const byId = priceMap && priceMap.byId instanceof Map ? priceMap.byId : new Map();
-  const byNameQty = priceMap && priceMap.byNameQty instanceof Map ? priceMap.byNameQty : new Map();
 
   return items.map((item) => {
     const normalizedName = cleanText(item.name || '').toLowerCase();
     const normalizedNameKey = normalizeItemNameKey(item.name || '');
-    const itemKey = `${normalizedNameKey}::${Number(item.quantity) || 1}`;
 
-    // Prefer strict cart-item UUID matching; fallback to unambiguous name+qty when needed.
+    // Strict mode: only trust checkout cart-item UUID matches.
     const matchedById = (item._itemId && byId.get(item._itemId)) || null;
-    const initialMatchedByNameQty = byNameQty.get(itemKey) || null;
-    let matchedByNameQty = initialMatchedByNameQty;
-    let matchedPriceRecord = matchedById || matchedByNameQty || null;
+    const matchedPriceRecord = matchedById || null;
 
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const rawAddOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
-
-    const draftUnitPriceValue = parseMoneyToNumber(item.priceText);
-    const draftBaseLineValue = Number.isFinite(draftUnitPriceValue)
-      ? Number(((item._isUnitPrice !== false ? draftUnitPriceValue * quantity : draftUnitPriceValue)).toFixed(2))
-      : null;
 
     let matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
@@ -1211,67 +1208,43 @@ function applyCheckoutPrices(items, priceMap) {
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
 
-    // Guardrail: name/qty fallback can occasionally latch onto subtotal-like values.
-    if (!matchedById && matchedByNameQty && Number.isFinite(draftBaseLineValue) && Number.isFinite(matchedLineValue)) {
-      const expectedWithAddOns = Number((draftBaseLineValue + rawAddOnsTotalValue).toFixed(2));
-      const isLargeAbsoluteJump = matchedLineValue - expectedWithAddOns >= 12;
-      const isLargeRelativeJump = expectedWithAddOns > 0 && (matchedLineValue / expectedWithAddOns) >= 2.2;
-
-      if (isLargeAbsoluteJump || isLargeRelativeJump) {
-        matchedByNameQty = null;
-        matchedPriceRecord = matchedById || null;
-        matchedPrice = item.priceText || null;
-        isUnitPrice = item._isUnitPrice !== false;
-        unitPriceValue = parseMoneyToNumber(item.priceText);
-        matchedLineValue = Number.isFinite(unitPriceValue)
-          ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
-          : null;
-      }
+    // Fail-closed: unmatched items are returned without numeric prices.
+    if (!matchedById || !matchedPriceRecord) {
+      matchedPrice = null;
+      isUnitPrice = item._isUnitPrice !== false;
+      unitPriceValue = null;
+      matchedLineValue = null;
     }
 
-    // Checkout price can be either base-only or already include modifiers depending on payload shape.
-    // If matched line is near draft base line, keep draft add-ons; otherwise assume checkout already includes them.
-    let addOnsTotalValue = rawAddOnsTotalValue;
-    if (matchedPriceRecord && Number.isFinite(matchedLineValue) && Number.isFinite(draftBaseLineValue)) {
-      const impliedAddOns = Number((matchedLineValue - draftBaseLineValue).toFixed(2));
-      addOnsTotalValue = impliedAddOns > 0 ? impliedAddOns : 0;
-    } else if (matchedPriceRecord) {
-      addOnsTotalValue = 0;
-    }
-
-    const lineTotalValue = matchedPriceRecord && Number.isFinite(matchedLineValue)
-      ? matchedLineValue
-      : (Number.isFinite(unitPriceValue)
-        ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
-        : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null));
+    const lineTotalValue = matchedById && Number.isFinite(matchedLineValue) ? matchedLineValue : null;
 
     return {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
-      priceText: matchedPrice || item.priceText || null,
+      priceText: matchedPrice || null,
       isUnitPrice,
-      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
-      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : null,
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : null,
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
-      addOnsTotalText: addOnsTotalValue > 0 ? formatSubtotal(addOnsTotalValue) : null,
-      addOnsTotalValue: addOnsTotalValue > 0 ? addOnsTotalValue : null,
+      addOnsTotalText: null,
+      addOnsTotalValue: null,
       notes: item.notes || null,
-      pricingSource: matchedById ? 'checkout-by-id' : (matchedByNameQty ? 'checkout-by-name-qty' : 'draft-order'),
+      pricingSource: matchedById ? 'checkout-by-id' : 'unmatched-no-authoritative-price',
       pricingDebug: {
         quantity,
         normalizedName,
         normalizedNameKey,
         matchedById: Boolean(matchedById),
-        matchedByNameQty: Boolean(matchedByNameQty),
-        matchedByNameQtyInitially: Boolean(initialMatchedByNameQty),
+        matchedByNameQty: false,
+        matchedByNameQtyInitially: false,
         matchedPriceText: matchedPrice || null,
         draftPriceText: item.priceText || null,
-        draftBaseLineValue: Number.isFinite(draftBaseLineValue) ? draftBaseLineValue : null,
+        draftBaseLineValue: null,
         matchedLineValue: Number.isFinite(matchedLineValue) ? matchedLineValue : null,
-        rawAddOnsTotalValue: Number(rawAddOnsTotalValue.toFixed(2)),
-        appliedAddOnsTotalValue: Number(addOnsTotalValue.toFixed(2)),
+        rawAddOnsTotalValue: null,
+        appliedAddOnsTotalValue: null,
         isUnitPrice
       }
     };
@@ -1574,6 +1547,8 @@ function extractItemsFromDraftOrderPayload(payload) {
 
         let effectiveUnitPriceValue = unitPriceValue;
         if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 30) {
+          const modifierNameKey = normalizeItemNameKey(optionName);
+          const looksLikeCommonSide = /(fries|drink|tea|lemonade|sauce|seasoning)/.test(modifierNameKey);
           const rawNumericAmount = typeof selected.value === 'number'
             ? selected.value
             : (selected.value && typeof selected.value === 'object' && typeof selected.value.amount === 'number'
@@ -1586,7 +1561,13 @@ function extractItemsFromDraftOrderPayload(payload) {
               .filter((candidate) => candidate > 0 && candidate <= 25);
 
             if (scaledCandidates.length > 0) {
-              const bestScaledCandidate = Math.max(...scaledCandidates);
+              // For side-like options, prefer realistic side-price ranges.
+              const sideLikeCandidates = looksLikeCommonSide
+                ? scaledCandidates.filter((candidate) => candidate >= 0.25 && candidate <= 3)
+                : [];
+              const bestScaledCandidate = sideLikeCandidates.length > 0
+                ? Math.max(...sideLikeCandidates)
+                : Math.max(...scaledCandidates);
               if (bestScaledCandidate < effectiveUnitPriceValue) {
                 effectiveUnitPriceValue = bestScaledCandidate;
               }
@@ -1594,8 +1575,6 @@ function extractItemsFromDraftOrderPayload(payload) {
           }
 
           if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 30) {
-            const modifierNameKey = normalizeItemNameKey(optionName);
-            const looksLikeCommonSide = /(fries|drink|tea|lemonade|sauce|seasoning)/.test(modifierNameKey);
             if (looksLikeCommonSide) {
               const dividedByTen = Number((effectiveUnitPriceValue / 10).toFixed(2));
               if (dividedByTen > 0 && dividedByTen <= 25) {
