@@ -1573,7 +1573,7 @@ function extractItemsFromDraftOrderPayload(payload) {
         const unitPriceValue = parseMoneyToNumber(priceText);
 
         let effectiveUnitPriceValue = unitPriceValue;
-        if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 40) {
+        if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 30) {
           const rawNumericAmount = typeof selected.value === 'number'
             ? selected.value
             : (selected.value && typeof selected.value === 'object' && typeof selected.value.amount === 'number'
@@ -1581,12 +1581,26 @@ function extractItemsFromDraftOrderPayload(payload) {
               : null);
 
           if (Number.isFinite(rawNumericAmount) && Number.isInteger(rawNumericAmount) && Math.abs(rawNumericAmount) >= 1000) {
-            const thousandScaled = Number((rawNumericAmount / 1000).toFixed(2));
+            const scaledCandidates = [100, 1000, 10000, 100000]
+              .map((scale) => Number((rawNumericAmount / scale).toFixed(2)))
+              .filter((candidate) => candidate > 0 && candidate <= 25);
 
-            // Some modifier payloads arrive in thousand-scaled minor units.
-            // Prefer this lower interpretation when the direct parse is implausibly high for an add-on.
-            if (thousandScaled > 0 && thousandScaled < effectiveUnitPriceValue && thousandScaled <= 25) {
-              effectiveUnitPriceValue = thousandScaled;
+            if (scaledCandidates.length > 0) {
+              const bestScaledCandidate = Math.max(...scaledCandidates);
+              if (bestScaledCandidate < effectiveUnitPriceValue) {
+                effectiveUnitPriceValue = bestScaledCandidate;
+              }
+            }
+          }
+
+          if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 30) {
+            const modifierNameKey = normalizeItemNameKey(optionName);
+            const looksLikeCommonSide = /(fries|drink|tea|lemonade|sauce|seasoning)/.test(modifierNameKey);
+            if (looksLikeCommonSide) {
+              const dividedByTen = Number((effectiveUnitPriceValue / 10).toFixed(2));
+              if (dividedByTen > 0 && dividedByTen <= 25) {
+                effectiveUnitPriceValue = dividedByTen;
+              }
             }
           }
         }
