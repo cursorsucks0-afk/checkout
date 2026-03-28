@@ -1552,8 +1552,28 @@ function extractItemsFromDraftOrderPayload(payload) {
         const selected = selectModifierPriceCandidate(option);
         const priceText = formatPrice(selected.value) || null;
         const unitPriceValue = parseMoneyToNumber(priceText);
-        const linePriceValue = Number.isFinite(unitPriceValue)
-          ? Number(((selected.isUnitPrice === false ? unitPriceValue : unitPriceValue * normalizedQty)).toFixed(2))
+
+        let effectiveUnitPriceValue = unitPriceValue;
+        if (Number.isFinite(effectiveUnitPriceValue) && effectiveUnitPriceValue >= 40) {
+          const rawNumericAmount = typeof selected.value === 'number'
+            ? selected.value
+            : (selected.value && typeof selected.value === 'object' && typeof selected.value.amount === 'number'
+              ? selected.value.amount
+              : null);
+
+          if (Number.isFinite(rawNumericAmount) && Number.isInteger(rawNumericAmount) && Math.abs(rawNumericAmount) >= 1000) {
+            const thousandScaled = Number((rawNumericAmount / 1000).toFixed(2));
+
+            // Some modifier payloads arrive in thousand-scaled minor units.
+            // Prefer this lower interpretation when the direct parse is implausibly high for an add-on.
+            if (thousandScaled > 0 && thousandScaled < effectiveUnitPriceValue && thousandScaled <= 25) {
+              effectiveUnitPriceValue = thousandScaled;
+            }
+          }
+        }
+
+        const linePriceValue = Number.isFinite(effectiveUnitPriceValue)
+          ? Number(((selected.isUnitPrice === false ? effectiveUnitPriceValue : effectiveUnitPriceValue * normalizedQty)).toFixed(2))
           : null;
 
         const label = Number.isFinite(linePriceValue)
