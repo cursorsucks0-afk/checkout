@@ -1064,6 +1064,7 @@ function extractCheckoutSubtotal(payload) {
 function extractCheckoutPriceMap(payload) {
   const byId = new Map();
   const byNameQty = new Map();
+  const ambiguousNameQtyKeys = new Set();
 
   const walk = (value) => {
     if (!value) {
@@ -1093,8 +1094,13 @@ function extractCheckoutPriceMap(payload) {
 
     if (candidatePrice && candidateName) {
       const key = `${candidateName.toLowerCase()}::${candidateQty}`;
-      if (!byNameQty.has(key)) {
+      if (ambiguousNameQtyKeys.has(key)) {
+        // Keep ambiguous keys disabled.
+      } else if (!byNameQty.has(key)) {
         byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+      } else {
+        ambiguousNameQtyKeys.add(key);
+        byNameQty.delete(key);
       }
     }
 
@@ -1124,9 +1130,10 @@ function applyCheckoutPrices(items, priceMap) {
     const normalizedName = cleanText(item.name || '').toLowerCase();
     const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
 
-    // Name/qty matching is too noisy in large checkout payloads and can map wrong prices.
-    // Prefer strict cart-item UUID matching only.
-    const matchedPriceRecord = (item._itemId && byId.get(item._itemId)) || null;
+    // Prefer strict cart-item UUID matching; fallback to unambiguous name+qty when needed.
+    const matchedById = (item._itemId && byId.get(item._itemId)) || null;
+    const matchedByNameQty = byNameQty.get(itemKey) || null;
+    const matchedPriceRecord = matchedById || matchedByNameQty || null;
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
@@ -1154,7 +1161,17 @@ function applyCheckoutPrices(items, priceMap) {
       addOnsTotalText: addOnsTotalValue > 0 ? formatSubtotal(addOnsTotalValue) : null,
       addOnsTotalValue: addOnsTotalValue > 0 ? addOnsTotalValue : null,
       notes: item.notes || null,
-      pricingSource: matchedPriceRecord ? 'checkout-by-id' : 'draft-order'
+      pricingSource: matchedById ? 'checkout-by-id' : (matchedByNameQty ? 'checkout-by-name-qty' : 'draft-order'),
+      pricingDebug: {
+        quantity,
+        matchedById: Boolean(matchedById),
+        matchedByNameQty: Boolean(matchedByNameQty),
+        matchedPriceText: matchedPrice || null,
+        draftPriceText: item.priceText || null,
+        rawAddOnsTotalValue: Number(rawAddOnsTotalValue.toFixed(2)),
+        appliedAddOnsTotalValue: Number(addOnsTotalValue.toFixed(2)),
+        isUnitPrice
+      }
     };
   });
 }
@@ -1358,31 +1375,36 @@ function extractItemsFromDraftOrderPayload(payload) {
         }
 
         const optionName = cleanText(option.title || option.name || option.label || '');
-        const optionQtyRaw =
-          option.selectedQuantity
-          ?? option.selectedQty
-          ?? option.quantity
-          ?? option.qty
-          ?? option.count
-          ?? null;
-        const optionQty = Number(optionQtyRaw);
+        const selectedQtyRaw = option.selectedQuantity ?? option.selectedQty ?? null;
+        const selectedQty = Number(selectedQtyRaw);
+        const fallbackQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
+        const fallbackQty = Number(fallbackQtyRaw);
         const isExplicitlySelected = Boolean(
           option.selected === true
           || option.isSelected === true
+          || option.isChosen === true
+          || option.checked === true
           || option.is_checked === true
         );
-        const hasPositiveQty = Number.isFinite(optionQty) && optionQty > 0;
+        const hasSelectedQty = Number.isFinite(selectedQty) && selectedQty > 0;
 
-        if (!optionName || (Number.isFinite(optionQty) && optionQty <= 0) || isLikelyNoiseText(optionName)) {
+        if (!optionName || isLikelyNoiseText(optionName)) {
           continue;
         }
 
-        // Some payloads include full option catalogs; only count clearly selected options.
-        if (!isExplicitlySelected && !hasPositiveQty) {
+        // Some payloads include full option catalogs with generic quantity fields.
+        // Only count options that are explicitly selected or have selectedQuantity signals.
+        if (!isExplicitlySelected && !hasSelectedQty) {
           continue;
         }
 
-        const normalizedQty = Number.isFinite(optionQty) && optionQty > 0 ? optionQty : 1;
+        let normalizedQty = 1;
+        if (hasSelectedQty) {
+          normalizedQty = selectedQty;
+        } else if (isExplicitlySelected && Number.isFinite(fallbackQty) && fallbackQty > 0) {
+          normalizedQty = fallbackQty;
+        }
+
         const selected = selectPriceCandidate(option);
         const priceText = formatPrice(selected.value) || null;
         const unitPriceValue = parseMoneyToNumber(priceText);
