@@ -782,6 +782,18 @@ function cleanText(text) {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+function normalizeItemNameKey(value) {
+  const cleaned = cleanText(value || '').toLowerCase();
+  if (!cleaned) {
+    return '';
+  }
+
+  return cleaned
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function buildRequestHeaders(cookieHeader) {
   const headers = {
     'user-agent':
@@ -1133,8 +1145,11 @@ function extractCheckoutPriceMap(payload) {
     const candidateSource = selectedForMap ? selectedForMap.source : null;
 
     if (candidatePrice && candidateName && candidateSource !== 'fallback') {
-      const key = `${candidateName.toLowerCase()}::${candidateQty}`;
-      if (ambiguousNameQtyKeys.has(key)) {
+      const normalizedNameKey = normalizeItemNameKey(candidateName);
+      const key = normalizedNameKey ? `${normalizedNameKey}::${candidateQty}` : '';
+      if (!key) {
+        // Ignore empty normalized keys.
+      } else if (ambiguousNameQtyKeys.has(key)) {
         // Keep ambiguous keys disabled.
       } else if (!byNameQty.has(key)) {
         byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
@@ -1168,7 +1183,8 @@ function applyCheckoutPrices(items, priceMap) {
 
   return items.map((item) => {
     const normalizedName = cleanText(item.name || '').toLowerCase();
-    const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
+    const normalizedNameKey = normalizeItemNameKey(item.name || '');
+    const itemKey = `${normalizedNameKey}::${Number(item.quantity) || 1}`;
 
     // Prefer strict cart-item UUID matching; fallback to unambiguous name+qty when needed.
     const matchedById = (item._itemId && byId.get(item._itemId)) || null;
@@ -1216,17 +1232,18 @@ function applyCheckoutPrices(items, priceMap) {
     // Checkout price can be either base-only or already include modifiers depending on payload shape.
     // If matched line is near draft base line, keep draft add-ons; otherwise assume checkout already includes them.
     let addOnsTotalValue = rawAddOnsTotalValue;
-    if (matchedPriceRecord && rawAddOnsTotalValue > 0 && Number.isFinite(matchedLineValue) && Number.isFinite(draftBaseLineValue)) {
-      const deltaToDraftBase = Math.abs(matchedLineValue - draftBaseLineValue);
-      const deltaToDraftWithAddOns = Math.abs(matchedLineValue - (draftBaseLineValue + rawAddOnsTotalValue));
-      addOnsTotalValue = deltaToDraftBase <= deltaToDraftWithAddOns ? rawAddOnsTotalValue : 0;
-    } else if (matchedPriceRecord && rawAddOnsTotalValue > 0 && !Number.isFinite(draftBaseLineValue)) {
+    if (matchedPriceRecord && Number.isFinite(matchedLineValue) && Number.isFinite(draftBaseLineValue)) {
+      const impliedAddOns = Number((matchedLineValue - draftBaseLineValue).toFixed(2));
+      addOnsTotalValue = impliedAddOns > 0 ? impliedAddOns : 0;
+    } else if (matchedPriceRecord) {
       addOnsTotalValue = 0;
     }
 
-    const lineTotalValue = Number.isFinite(unitPriceValue)
-      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
-      : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
+    const lineTotalValue = matchedPriceRecord && Number.isFinite(matchedLineValue)
+      ? matchedLineValue
+      : (Number.isFinite(unitPriceValue)
+        ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
+        : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null));
 
     return {
       name: item.name,
@@ -1244,6 +1261,8 @@ function applyCheckoutPrices(items, priceMap) {
       pricingSource: matchedById ? 'checkout-by-id' : (matchedByNameQty ? 'checkout-by-name-qty' : 'draft-order'),
       pricingDebug: {
         quantity,
+        normalizedName,
+        normalizedNameKey,
         matchedById: Boolean(matchedById),
         matchedByNameQty: Boolean(matchedByNameQty),
         matchedByNameQtyInitially: Boolean(initialMatchedByNameQty),
