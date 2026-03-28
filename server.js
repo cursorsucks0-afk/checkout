@@ -1097,6 +1097,34 @@ function extractCheckoutPriceMap(payload) {
   const byNameQty = new Map();
   const ambiguousNameQtyKeys = new Set();
 
+  const findNestedPriceCandidate = (node, depth = 2) => {
+    if (!node || typeof node !== 'object' || depth < 0) {
+      return null;
+    }
+
+    const direct = selectPriceCandidate(node);
+    if (direct && direct.value != null) {
+      return direct;
+    }
+
+    if (depth === 0) {
+      return null;
+    }
+
+    for (const child of Object.values(node)) {
+      if (!child || typeof child !== 'object') {
+        continue;
+      }
+
+      const nested = findNestedPriceCandidate(child, depth - 1);
+      if (nested && nested.value != null) {
+        return nested;
+      }
+    }
+
+    return null;
+  };
+
   const extractCandidateIds = (candidate) => {
     if (!candidate || typeof candidate !== 'object') {
       return [];
@@ -1170,7 +1198,10 @@ function extractCheckoutPriceMap(payload) {
 
     // For strict UUID matches we can still use broader fallback candidate extraction.
     if (hasItemId) {
-      const selected = selectPriceCandidate(candidate);
+      const selected = findNestedPriceCandidate(candidate, 2) || { value: null, isUnitPrice: false };
+      if (selected.value == null) {
+        return null;
+      }
       return {
         priceText: formatPrice(selected.value),
         isUnitPrice: selected.isUnitPrice !== false,
@@ -1251,8 +1282,22 @@ function applyCheckoutPrices(items, priceMap) {
     const normalizedNameKey = normalizeItemNameKey(item.name || '');
 
     // Strict mode: only trust checkout cart-item UUID matches.
-    const normalizedItemId = normalizeUuidLike(item._itemId);
-    const matchedById = (normalizedItemId && byId.get(normalizedItemId)) || null;
+    const rawItemIds = Array.isArray(item._itemIds) ? item._itemIds : [item._itemId];
+    const normalizedItemIds = Array.from(new Set(
+      rawItemIds
+        .map((id) => normalizeUuidLike(id))
+        .filter((id) => Boolean(id))
+    ));
+    let matchedById = null;
+    let matchedId = null;
+    for (const candidateId of normalizedItemIds) {
+      const hit = byId.get(candidateId);
+      if (hit) {
+        matchedById = hit;
+        matchedId = candidateId;
+        break;
+      }
+    }
     const matchedPriceRecord = matchedById || null;
 
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
@@ -1293,7 +1338,8 @@ function applyCheckoutPrices(items, priceMap) {
       notes: item.notes || null,
       pricingSource: matchedById ? 'checkout-by-id' : 'unmatched-no-authoritative-price',
       pricingDebug: {
-        itemId: normalizedItemId,
+        itemId: matchedId || normalizedItemIds[0] || null,
+        itemIdCandidates: normalizedItemIds,
         checkoutIdMapSize: byId.size,
         quantity,
         normalizedName,
@@ -1677,6 +1723,16 @@ function extractItemsFromDraftOrderPayload(payload) {
     }
 
     const quantity = parseQuantity(item.quantity);
+    const itemIdCandidates = [
+      item.shoppingCartItemUuid,
+      item.shoppingCartItemUUID,
+      item.itemUuid,
+      item.itemUUID,
+      item.uuid
+    ]
+      .map((id) => normalizeUuidLike(id))
+      .filter((id) => Boolean(id));
+    const normalizedUniqueItemIdCandidates = Array.from(new Set(itemIdCandidates));
     const itemId = cleanText(item.shoppingCartItemUuid || item.shoppingCartItemUUID || item.itemUuid || item.uuid || '');
     const key = itemId || `${name}::${quantity}`;
 
@@ -1686,6 +1742,7 @@ function extractItemsFromDraftOrderPayload(payload) {
         name,
         quantity,
         itemId: itemId || null,
+        itemIds: normalizedUniqueItemIdCandidates,
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
         isUnitPrice: true,
@@ -1711,6 +1768,12 @@ function extractItemsFromDraftOrderPayload(payload) {
 
     if (!record.itemId && itemId) {
       record.itemId = itemId;
+    }
+
+    for (const candidateId of normalizedUniqueItemIdCandidates) {
+      if (!record.itemIds.includes(candidateId)) {
+        record.itemIds.push(candidateId);
+      }
     }
 
     if (!record.priceText) {
@@ -1802,6 +1865,7 @@ function extractItemsFromDraftOrderPayload(payload) {
       name: entry.name,
       quantity,
       _itemId: entry.itemId || null,
+      _itemIds: Array.isArray(entry.itemIds) ? entry.itemIds : [],
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
       _isUnitPrice: entry.isUnitPrice !== false,
