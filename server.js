@@ -112,7 +112,7 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     const result = extractOrderData(html, resolvedUrl);
     result.diagnostics.authCookieProvided = useAuthCookie;
 
-    if (useAuthCookie) {
+    if (useAuthCookie && result.itemCount === 0) {
       const draftOrderFallback = await extractItemsWithDraftOrderByUuid(resolvedUrl, effectiveCookie, html);
       result.diagnostics.draftOrderByUuidFallback = {
         attempted: true,
@@ -220,7 +220,7 @@ function extractOrderData(html, sourceUrl) {
     name: item.name,
     quantity: item.quantity,
     priceText: item.priceText || null,
-    isUnitPrice: false,
+    isUnitPrice: item._isUnitPrice !== false,
     unitPriceText: item._unitPriceText || null,
     lineTotalText: item._lineTotalText || item.priceText || null,
     unitPriceValue: Number.isFinite(item._unitPriceValue) ? item._unitPriceValue : null,
@@ -228,7 +228,10 @@ function extractOrderData(html, sourceUrl) {
     imageUrl: item.imageUrl || null,
     notes: item.notes || null
   }));
-  const subtotal = calculateSubtotalFromItems(uniqueItems);
+  const checkoutSubtotal = extractClearlyStatedCheckoutSubtotal(parsedJsonBlobs);
+  const computedSubtotal = calculateSubtotalFromItems(uniqueItems);
+  const subtotal = Number.isFinite(checkoutSubtotal?.value) ? checkoutSubtotal.value : computedSubtotal;
+  const subtotalText = checkoutSubtotal?.formattedText || formatSubtotal(subtotal);
 
   return {
     sourceUrl,
@@ -238,15 +241,126 @@ function extractOrderData(html, sourceUrl) {
     items: publicItems,
     itemCount: unique.size,
     subtotal,
-    subtotalText: formatSubtotal(subtotal),
+    subtotalText,
+    subtotalMode: Number.isFinite(checkoutSubtotal?.value) ? 'auto' : 'manual',
+    hasCheckoutSubtotal: Number.isFinite(checkoutSubtotal?.value),
+    checkoutSubtotalSource: checkoutSubtotal?.source || null,
     diagnostics: {
       parsedJsonBlobs: parsedJsonBlobs.length,
       rawItemCandidates: extractionState.rawItemCandidates,
       extractionSources: extractionState.sources.slice(0, 30),
       guestJoinPayloadFound: extractionState.guestJoinPayloadFound,
-      guestPresentationItems: extractionState.guestPresentationItems
+      guestPresentationItems: extractionState.guestPresentationItems,
+      checkoutSubtotalDetected: Number.isFinite(checkoutSubtotal?.value)
     }
   };
+}
+
+function extractClearlyStatedCheckoutSubtotal(parsedJsonBlobs) {
+  if (!Array.isArray(parsedJsonBlobs) || parsedJsonBlobs.length === 0) {
+    return null;
+  }
+
+  for (const blob of parsedJsonBlobs) {
+    const data = blob && blob.data ? blob.data : null;
+    if (!data || typeof data !== 'object') {
+      continue;
+    }
+
+    const checkoutPayloads = findNestedObject(data, (obj) => obj && typeof obj === 'object' && obj.checkoutPayloads && typeof obj.checkoutPayloads === 'object');
+    const payload = checkoutPayloads && checkoutPayloads.checkoutPayloads ? checkoutPayloads.checkoutPayloads : null;
+    if (!payload) {
+      continue;
+    }
+
+    // Preferred explicit field from getCheckoutPresentationV1 response:
+    // checkoutPayloads.subtotal.subtotal.{formattedValue,value.amountE5}
+    const subtotalNode = payload.subtotal && payload.subtotal.subtotal ? payload.subtotal.subtotal : null;
+    if (subtotalNode && typeof subtotalNode === 'object') {
+      const parsed = parseCheckoutSubtotalNode(subtotalNode);
+      if (Number.isFinite(parsed?.value)) {
+        return {
+          value: parsed.value,
+          formattedText: parsed.formattedText,
+          source: 'checkoutPayloads.subtotal.subtotal'
+        };
+      }
+    }
+
+    // Secondary fallback from total payload when subtotal is missing.
+    const totalNode = payload.total && payload.total.total ? payload.total.total : null;
+    if (totalNode && typeof totalNode === 'object') {
+      const parsed = parseCheckoutSubtotalNode(totalNode);
+      if (Number.isFinite(parsed?.value)) {
+        return {
+          value: parsed.value,
+          formattedText: parsed.formattedText,
+          source: 'checkoutPayloads.total.total'
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseCheckoutSubtotalNode(node) {
+  if (!node || typeof node !== 'object') {
+    return null;
+  }
+
+  const formattedText = typeof node.formattedValue === 'string' ? cleanText(node.formattedValue) : null;
+  const valueObj = node.value && typeof node.value === 'object' ? node.value : null;
+  if (!valueObj) {
+    return {
+      value: parseMoneyToNumber(formattedText),
+      formattedText
+    };
+  }
+
+  const amountE5 = Number(valueObj.amountE5);
+  if (Number.isFinite(amountE5)) {
+    const value = Number((amountE5 / 100000).toFixed(2));
+    return { value, formattedText: formattedText || formatSubtotal(value) };
+  }
+
+  const amount = Number(valueObj.amount);
+  if (Number.isFinite(amount)) {
+    const value = Number(amount.toFixed(2));
+    return { value, formattedText: formattedText || formatSubtotal(value) };
+  }
+
+  return {
+    value: parseMoneyToNumber(formattedText),
+    formattedText
+  };
+}
+
+function findNestedObject(root, predicate) {
+  if (!root || typeof root !== 'object') {
+    return null;
+  }
+
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== 'object') {
+      continue;
+    }
+
+    if (predicate(current)) {
+      return current;
+    }
+
+    const values = Array.isArray(current) ? current : Object.values(current);
+    for (const value of values) {
+      if (value && typeof value === 'object') {
+        stack.push(value);
+      }
+    }
+  }
+
+  return null;
 }
 
 function tryPushJson(text, parsedJsonBlobs, sources, sourceLabel) {
@@ -537,19 +651,23 @@ function normalizeItem(candidate) {
 
   const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
 
-  const priceCandidate = selectPriceCandidate(candidate);
+  const selectedPrice = selectPriceCandidate(candidate);
+  const priceCandidate = selectedPrice.value;
 
   const priceText = formatPrice(priceCandidate);
-  const lineTotalValue = parseMoneyToNumber(priceText);
-  const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
-    ? Number((lineTotalValue / quantity).toFixed(2))
+  const priceValue = parseMoneyToNumber(priceText);
+  const isUnitPrice = selectedPrice.isUnitPrice !== false;
+  const unitPriceValue = Number.isFinite(priceValue) ? priceValue : null;
+  const lineTotalValue = Number.isFinite(priceValue)
+    ? Number(((isUnitPrice ? priceValue * quantity : priceValue)).toFixed(2))
     : null;
 
   return {
     name,
     quantity,
     priceText,
-    _priceValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
+    _priceValue: unitPriceValue,
+    _isUnitPrice: isUnitPrice,
     _unitPriceValue: unitPriceValue,
     _lineTotalValue: lineTotalValue,
     _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : priceText,
@@ -560,26 +678,73 @@ function normalizeItem(candidate) {
 
 function selectPriceCandidate(candidate) {
   if (candidate.totalPrice != null) {
-    return candidate.totalPrice;
+    return { value: candidate.totalPrice, isUnitPrice: false };
   }
 
   if (candidate.subtotal != null) {
-    return candidate.subtotal;
+    return { value: candidate.subtotal, isUnitPrice: false };
   }
 
   if (candidate.amount != null) {
-    return candidate.amount;
+    return { value: candidate.amount, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.amount) };
   }
 
   if (candidate.price != null) {
-    return candidate.price;
+    return { value: candidate.price, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.price) };
   }
 
   if (candidate.unitPrice != null) {
-    return candidate.unitPrice;
+    return { value: candidate.unitPrice, isUnitPrice: true };
   }
 
-  return null;
+  return { value: null, isUnitPrice: false };
+}
+
+function inferUnitPriceFromCandidate(candidate, rawPrice) {
+  const quantityRaw =
+    candidate.quantity ??
+    candidate.qty ??
+    candidate.count ??
+    candidate.itemQuantity ??
+    candidate.units ??
+    candidate.numItems;
+  const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
+
+  const explicitTotalKeys = [
+    'lineTotal',
+    'lineAmount',
+    'extendedPrice',
+    'itemTotal',
+    'total',
+    'subtotal'
+  ];
+
+  for (const key of explicitTotalKeys) {
+    if (candidate[key] != null) {
+      return false;
+    }
+  }
+
+  const normalizedText = String(
+    (rawPrice && typeof rawPrice === 'object' && (rawPrice.displayString || rawPrice.formattedPrice || rawPrice.displayPrice))
+      || rawPrice
+      || ''
+  ).toLowerCase();
+
+  if (normalizedText.includes('each') || normalizedText.includes('ea')) {
+    return true;
+  }
+
+  if (normalizedText.includes('total') || normalizedText.includes('subtotal')) {
+    return false;
+  }
+
+  // Generic price fields on item records are most often unit prices.
+  if (quantity > 1) {
+    return true;
+  }
+
+  return true;
 }
 
 function calculateSubtotalFromItems(items) {
@@ -602,13 +767,14 @@ function calculateSubtotalFromItems(items) {
       continue;
     }
 
-    const parsedAmount = Number.isFinite(item._priceValue)
-      ? item._priceValue
-      : parseMoneyToNumber(item.priceText || item._lineTotalText || item.lineTotalText || null);
+    const parsedAmount = Number.isFinite(item._priceValue) ? item._priceValue : parseMoneyToNumber(item.priceText);
     if (!Number.isFinite(parsedAmount)) {
       continue;
     }
-    subtotal += parsedAmount;
+
+    const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
+    const lineAmount = item._isUnitPrice ? parsedAmount * quantity : parsedAmount;
+    subtotal += lineAmount;
   }
 
   return Number(subtotal.toFixed(2));
@@ -901,7 +1067,7 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     });
 
     if (!response.ok) {
-      return { byId: new Map() };
+      return { byId: new Map(), byNameQty: new Map() };
     }
 
     const text = await response.text();
@@ -909,17 +1075,18 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     try {
       json = JSON.parse(text);
     } catch {
-      return { byId: new Map() };
+      return { byId: new Map(), byNameQty: new Map() };
     }
 
     return extractCheckoutPriceMap(json);
   } catch {
-    return { byId: new Map() };
+    return { byId: new Map(), byNameQty: new Map() };
   }
 }
 
 function extractCheckoutPriceMap(payload) {
   const byId = new Map();
+  const byNameQty = new Map();
 
   const walk = (value) => {
     if (!value) {
@@ -937,14 +1104,25 @@ function extractCheckoutPriceMap(payload) {
       return;
     }
 
+    const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
+    const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
+    const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
     const selected = selectPriceCandidate(value);
-    const candidatePrice = formatPrice(selected) || null;
+    const candidatePrice = formatPrice(selected.value) || null;
+    const candidateIsUnit = selected.isUnitPrice !== false;
     const candidateId = cleanText(
       value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
     );
 
+    if (candidatePrice && candidateName) {
+      const key = `${candidateName.toLowerCase()}::${candidateQty}`;
+      if (!byNameQty.has(key)) {
+        byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+      }
+    }
+
     if (candidatePrice && candidateId && !byId.has(candidateId)) {
-      byId.set(candidateId, { priceText: candidatePrice });
+      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
     }
 
     for (const child of Object.values(value)) {
@@ -954,7 +1132,7 @@ function extractCheckoutPriceMap(payload) {
 
   walk(payload);
 
-  return { byId };
+  return { byId, byNameQty };
 }
 
 function applyCheckoutPrices(items, priceMap) {
@@ -963,33 +1141,36 @@ function applyCheckoutPrices(items, priceMap) {
   }
 
   const byId = priceMap && priceMap.byId instanceof Map ? priceMap.byId : new Map();
-  const hasCheckoutPriceMap = byId.size > 0;
+  const byNameQty = priceMap && priceMap.byNameQty instanceof Map ? priceMap.byNameQty : new Map();
 
   return items.map((item) => {
-    const matchedPriceRecord = item._itemId ? byId.get(item._itemId) : null;
+    const normalizedName = cleanText(item.name || '').toLowerCase();
+    const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
+
+    const matchedPriceRecord =
+      (item._itemId && byId.get(item._itemId)) ||
+      byNameQty.get(itemKey) ||
+      null;
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
+    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+      ? matchedPriceRecord.isUnitPrice !== false
+      : item._isUnitPrice !== false;
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-
-    // Safety guard: when checkout map exists, disable all fallback matching logic.
-    const effectivePriceText = hasCheckoutPriceMap
-      ? (matchedPrice || item._lineTotalText || item.priceText || null)
-      : (matchedPrice || item._lineTotalText || item.priceText || null);
-
-    const lineTotalValue = parseMoneyToNumber(effectivePriceText);
-    const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
-      ? Number((lineTotalValue / quantity).toFixed(2))
+    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
+    const lineTotalValue = Number.isFinite(unitPriceValue)
+      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
 
     return {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
-      priceText: effectivePriceText,
-      isUnitPrice: false,
-      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (item._unitPriceText || item.priceText || null),
-      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (effectivePriceText || item._lineTotalText || item.priceText || null),
+      priceText: matchedPrice || item.priceText || null,
+      isUnitPrice,
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       notes: item.notes || null
@@ -1232,13 +1413,15 @@ function extractItemsFromDraftOrderPayload(payload) {
         itemId: itemId || null,
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
+        isUnitPrice: true,
         modifiers: new Set()
       };
 
       const selected = selectPriceCandidate(item);
-      const selectedPriceText = formatPrice(selected) || null;
+      const selectedPriceText = formatPrice(selected.value) || null;
       if (selectedPriceText) {
         record.priceText = selectedPriceText;
+        record.isUnitPrice = selected.isUnitPrice !== false;
       }
 
       byKey.set(key, record);
@@ -1255,9 +1438,10 @@ function extractItemsFromDraftOrderPayload(payload) {
 
     if (!record.priceText) {
       const selected = selectPriceCandidate(item);
-      const candidatePriceText = formatPrice(selected);
+      const candidatePriceText = formatPrice(selected.value);
       if (candidatePriceText) {
         record.priceText = candidatePriceText;
+        record.isUnitPrice = selected.isUnitPrice !== false;
       }
     }
 
@@ -1285,9 +1469,9 @@ function extractItemsFromDraftOrderPayload(payload) {
   return Array.from(byKey.values()).map((entry) => {
     const modifiers = Array.from(entry.modifiers.values());
     const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
-    const lineTotalValue = parseMoneyToNumber(entry.priceText);
-    const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
-      ? Number((lineTotalValue / quantity).toFixed(2))
+    const unitPriceValue = parseMoneyToNumber(entry.priceText);
+    const lineTotalValue = Number.isFinite(unitPriceValue)
+      ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
     return {
       name: entry.name,
@@ -1295,7 +1479,7 @@ function extractItemsFromDraftOrderPayload(payload) {
       _itemId: entry.itemId || null,
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
-      _isUnitPrice: false,
+      _isUnitPrice: entry.isUnitPrice !== false,
       _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
