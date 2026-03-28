@@ -8,11 +8,6 @@ const HARDCODED_GROUP_COOKIE = "uev2.id.session_v2=cfa0cf3d-b0d2-414c-984b-011f3
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const GROUP_ORDER_CACHE_TTL_MS = 20000;
-const GROUP_ORDER_CACHE_MAX_ENTRIES = 200;
-const PAGE_FETCH_TIMEOUT_MS = 10000;
-const API_FETCH_TIMEOUT_MS = 8000;
-const groupOrderResponseCache = new Map();
 
 app.disable('etag');
 
@@ -94,33 +89,11 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     };
   }
 
-  const cacheKey = buildGroupOrderCacheKey(parsed.toString());
-  const now = Date.now();
-  const cached = groupOrderResponseCache.get(cacheKey);
-  const cachedLooksSuspicious = Boolean(
-    cached
-    && cached.payload
-    && Number(cached.payload.itemCount || 0) > 0
-    && Number(cached.payload.subtotal || 0) <= 0
-  );
-
-  if (cached && !cachedLooksSuspicious && (now - cached.cachedAt) < GROUP_ORDER_CACHE_TTL_MS) {
-    const clone = JSON.parse(JSON.stringify(cached.payload));
-    clone.diagnostics = clone.diagnostics || {};
-    clone.diagnostics.cacheHit = true;
-    clone.diagnostics.cachedAgeMs = now - cached.cachedAt;
-
-    return {
-      statusCode: 200,
-      data: clone
-    };
-  }
-
   try {
-    const response = await fetchWithTimeout(parsed.toString(), {
+    const response = await fetch(parsed.toString(), {
       headers: buildRequestHeaders(effectiveCookie),
       redirect: 'follow'
-    }, PAGE_FETCH_TIMEOUT_MS);
+    });
 
     const html = await response.text();
 
@@ -139,7 +112,7 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     const result = extractOrderData(html, resolvedUrl);
     result.diagnostics.authCookieProvided = useAuthCookie;
 
-    if (useAuthCookie && shouldRunDraftFallbackForResult(result)) {
+    if (useAuthCookie && result.itemCount === 0) {
       const draftOrderFallback = await extractItemsWithDraftOrderByUuid(resolvedUrl, effectiveCookie, html);
       result.diagnostics.draftOrderByUuidFallback = {
         attempted: true,
@@ -151,22 +124,14 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       };
 
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
-        const shouldUseFallback = shouldUseFallbackItems(result.items, draftOrderFallback.items);
-        if (shouldUseFallback) {
-          result.items = draftOrderFallback.items;
-          result.itemCount = draftOrderFallback.items.length;
-          result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
-          result.subtotalText = formatSubtotal(result.subtotal);
-          result.diagnostics.draftOrderByUuidFallback.used = true;
-          result.diagnostics.draftOrderByUuidFallback.reason = null;
-        } else {
-          result.diagnostics.draftOrderByUuidFallback.used = false;
-          result.diagnostics.draftOrderByUuidFallback.reason = 'existing-item-pricing-preferred';
-        }
+        result.items = draftOrderFallback.items;
+        result.itemCount = draftOrderFallback.items.length;
+        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
+        result.subtotalText = formatSubtotal(result.subtotal);
+        result.diagnostics.draftOrderByUuidFallback.used = true;
+        result.diagnostics.draftOrderByUuidFallback.reason = null;
       }
     }
-
-    setCachedGroupOrderResponse(cacheKey, result);
 
     return {
       statusCode: 200,
@@ -180,134 +145,6 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
         details: error instanceof Error ? error.message : String(error)
       }
     };
-  }
-}
-
-function countPositivePricedItems(items) {
-  if (!Array.isArray(items) || items.length === 0) {
-    return 0;
-  }
-
-  let count = 0;
-  for (const item of items) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-
-    const lineValue = Number(item._lineTotalValue);
-    const unitValue = Number(item._unitPriceValue);
-    const parsedText = parseMoneyToNumber(item.priceText || item._lineTotalText || item.lineTotalText || '');
-
-    if ((Number.isFinite(lineValue) && lineValue > 0) || (Number.isFinite(unitValue) && unitValue > 0) || (Number.isFinite(parsedText) && parsedText > 0)) {
-      count += 1;
-    }
-  }
-
-  return count;
-}
-
-function shouldRunDraftFallbackForResult(result) {
-  const itemCount = Number(result && result.itemCount ? result.itemCount : 0);
-  const subtotal = Number(result && result.subtotal ? result.subtotal : 0);
-  const items = Array.isArray(result && result.items) ? result.items : [];
-  const pricedCount = countPositivePricedItems(items);
-
-  if (itemCount === 0) {
-    return true;
-  }
-
-  if (itemCount > 0 && subtotal <= 0) {
-    return true;
-  }
-
-  if (itemCount > 0 && pricedCount === 0) {
-    return true;
-  }
-
-  return false;
-}
-
-function shouldUseFallbackItems(currentItems, fallbackItems) {
-  const currentList = Array.isArray(currentItems) ? currentItems : [];
-  const fallbackList = Array.isArray(fallbackItems) ? fallbackItems : [];
-
-  if (currentList.length === 0 && fallbackList.length > 0) {
-    return true;
-  }
-
-  const currentPriced = countPositivePricedItems(currentList);
-  const fallbackPriced = countPositivePricedItems(fallbackList);
-  if (fallbackPriced > currentPriced) {
-    return true;
-  }
-
-  const currentSubtotal = calculateSubtotalFromItems(currentList);
-  const fallbackSubtotal = calculateSubtotalFromItems(fallbackList);
-  if (fallbackPriced === currentPriced && fallbackSubtotal > (currentSubtotal + 0.01)) {
-    return true;
-  }
-
-  return false;
-}
-
-function buildGroupOrderCacheKey(inputUrl) {
-  try {
-    const parsed = new URL(inputUrl);
-    const significantParams = [
-      'draftOrderUUID',
-      'draft_order_uuid',
-      'groupOrderUUID',
-      'group_order_uuid',
-      'uev2.do'
-    ];
-    const filtered = new URLSearchParams();
-    for (const key of significantParams) {
-      const value = parsed.searchParams.get(key);
-      if (value) {
-        filtered.set(key, value);
-      }
-    }
-
-    const query = filtered.toString();
-    return `${parsed.origin}${parsed.pathname}${query ? `?${query}` : ''}`.toLowerCase();
-  } catch {
-    return String(inputUrl || '').trim().toLowerCase();
-  }
-}
-
-function setCachedGroupOrderResponse(cacheKey, payload) {
-  if (!cacheKey || !payload || typeof payload !== 'object') {
-    return;
-  }
-
-  const looksSuspicious = Number(payload.itemCount || 0) > 0 && Number(payload.subtotal || 0) <= 0;
-  if (looksSuspicious) {
-    return;
-  }
-
-  if (groupOrderResponseCache.size >= GROUP_ORDER_CACHE_MAX_ENTRIES) {
-    const oldestKey = groupOrderResponseCache.keys().next().value;
-    if (oldestKey) {
-      groupOrderResponseCache.delete(oldestKey);
-    }
-  }
-
-  groupOrderResponseCache.set(cacheKey, {
-    cachedAt: Date.now(),
-    payload
-  });
-}
-
-async function fetchWithTimeout(url, options = {}, timeoutMs = API_FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -974,7 +811,7 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
   const cookieMap = parseCookieMap(cookieHeader);
   const loc = parseLocationCookie(cookieMap.get('uev2.loc'));
 
-  const autoJoinPromise = addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc);
+  const autoJoin = await addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc);
 
   const requestHeaders = {
     accept: '*/*',
@@ -996,18 +833,18 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
   }
 
   try {
-    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/getDraftOrderByUuidV2', {
+    const response = await fetch('https://www.ubereats.com/_p/api/getDraftOrderByUuidV2', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify({ draftOrderUUID })
-    }, API_FETCH_TIMEOUT_MS);
+    });
 
     const text = await response.text();
     if (!response.ok) {
       return {
         ok: false,
         reason: `draft-order-http-${response.status}`,
-        autoJoin: await autoJoinPromise,
+        autoJoin,
         items: []
       };
     }
@@ -1019,42 +856,20 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
       return {
         ok: false,
         reason: 'draft-order-invalid-json',
-        autoJoin: await autoJoinPromise,
+        autoJoin,
         items: []
       };
     }
 
     const extractedItems = extractItemsFromDraftOrderPayload(json);
-
-    const shouldFetchCheckoutPrices = extractedItems.some((item) => {
-      if (!item || typeof item !== 'object') {
-        return true;
-      }
-      const hasLineValue = Number.isFinite(Number(item._lineTotalValue));
-      const hasUnitValue = Number.isFinite(Number(item._unitPriceValue));
-      const parsedTextPrice = parseMoneyToNumber(item.priceText || '');
-      const hasPositiveLine = hasLineValue && Number(item._lineTotalValue) > 0;
-      const hasPositiveUnit = hasUnitValue && Number(item._unitPriceValue) > 0;
-      const hasPositiveText = Number.isFinite(parsedTextPrice) && parsedTextPrice > 0;
-
-      // Zero-dollar placeholders are common for base items priced by add-ons;
-      // force checkout enrichment in those cases so line totals are accurate.
-      return !(hasPositiveLine || hasPositiveUnit || hasPositiveText);
-    });
-
-    let pricedItems = extractedItems;
-    if (shouldFetchCheckoutPrices) {
-      const checkoutPrices = await fetchCheckoutPresentationPriceMap(
-        sourceUrl,
-        cookieHeader,
-        draftOrderUUID,
-        cookieMap,
-        loc
-      );
-      pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
-    }
-
-    const autoJoin = await autoJoinPromise;
+    const checkoutPrices = await fetchCheckoutPresentationPriceMap(
+      sourceUrl,
+      cookieHeader,
+      draftOrderUUID,
+      cookieMap,
+      loc
+    );
+    const pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
 
     return {
       ok: true,
@@ -1066,7 +881,7 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
-      autoJoin: await autoJoinPromise,
+      autoJoin,
       items: []
     };
   }
@@ -1096,8 +911,30 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
     payloadTypes: [
       'cartItems',
       'subtotal',
+      'basketSize',
+      'promotion',
+      'restrictedItems',
+      'venueSectionPicker',
+      'locationInfo',
+      'upsellCatalogSections',
       'subTotalFareBreakdown',
-      'total'
+      'canonicalProductStorePickerPayload',
+      'storeSwitcherActionableBannerPayload',
+      'fareBreakdown',
+      'promoAndMembershipSavingBannerPayload',
+      'passBanner',
+      'passBannerOnCartPayload',
+      'merchantMembership',
+      'giftInfo',
+      'total',
+      'paymentProfilesEligibility',
+      'requestUtensilPayload',
+      'upsellFeed',
+      'upfrontTipping',
+      'promoAndMembershipSavingBannerPayloadCheckout',
+      'deliveryOptInInfo',
+      'eta',
+      'orderConfirmations'
     ],
     draftOrderUUID,
     isGroupOrder: true,
@@ -1109,11 +946,11 @@ async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftO
   };
 
   try {
-    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/getCheckoutPresentationV1', {
+    const response = await fetch('https://www.ubereats.com/_p/api/getCheckoutPresentationV1', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify(requestBody)
-    }, API_FETCH_TIMEOUT_MS);
+    });
 
     if (!response.ok) {
       return { byId: new Map(), byNameQty: new Map() };
@@ -1165,19 +1002,13 @@ function extractCheckoutPriceMap(payload) {
 
     if (candidatePrice && candidateName) {
       const key = `${candidateName.toLowerCase()}::${candidateQty}`;
-      const nextRecord = { priceText: candidatePrice, isUnitPrice: candidateIsUnit };
-      const existingRecord = byNameQty.get(key);
-      if (!existingRecord || shouldPreferPriceRecord(nextRecord, existingRecord)) {
-        byNameQty.set(key, nextRecord);
+      if (!byNameQty.has(key)) {
+        byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
       }
     }
 
-    if (candidatePrice && candidateId) {
-      const nextRecord = { priceText: candidatePrice, isUnitPrice: candidateIsUnit };
-      const existingRecord = byId.get(candidateId);
-      if (!existingRecord || shouldPreferPriceRecord(nextRecord, existingRecord)) {
-        byId.set(candidateId, nextRecord);
-      }
+    if (candidatePrice && candidateId && !byId.has(candidateId)) {
+      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
     }
 
     for (const child of Object.values(value)) {
@@ -1209,25 +1040,11 @@ function applyCheckoutPrices(items, priceMap) {
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
-    const matchedIsUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.isUnitPrice !== false
       : item._isUnitPrice !== false;
-
-    const existingRecord = {
-      priceText: item.priceText || null,
-      isUnitPrice: item._isUnitPrice !== false
-    };
-    const nextRecord = {
-      priceText: matchedPrice || null,
-      isUnitPrice: matchedIsUnitPrice
-    };
-    const useMatchedRecord = shouldPreferPriceRecord(nextRecord, existingRecord);
-    const selectedPriceText = useMatchedRecord
-      ? (matchedPrice || item.priceText || null)
-      : (item.priceText || matchedPrice || null);
-    const isUnitPrice = useMatchedRecord ? matchedIsUnitPrice : (item._isUnitPrice !== false);
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const unitPriceValue = parseMoneyToNumber(selectedPriceText);
+    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
     const lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
@@ -1236,43 +1053,15 @@ function applyCheckoutPrices(items, priceMap) {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
-      priceText: selectedPriceText,
+      priceText: matchedPrice || item.priceText || null,
       isUnitPrice,
-      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : selectedPriceText,
-      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : selectedPriceText,
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       notes: item.notes || null
     };
   });
-}
-
-function shouldPreferPriceRecord(nextRecord, currentRecord) {
-  const nextText = nextRecord && typeof nextRecord === 'object' ? nextRecord.priceText : null;
-  const currentText = currentRecord && typeof currentRecord === 'object' ? currentRecord.priceText : null;
-  const nextValue = parseMoneyToNumber(nextText);
-  const currentValue = parseMoneyToNumber(currentText);
-
-  const nextPositive = Number.isFinite(nextValue) && nextValue > 0;
-  const currentPositive = Number.isFinite(currentValue) && currentValue > 0;
-
-  if (nextPositive && !currentPositive) {
-    return true;
-  }
-
-  if (nextPositive && currentPositive && nextValue > (currentValue + 0.009)) {
-    return true;
-  }
-
-  if (Number.isFinite(nextValue) && !Number.isFinite(currentValue)) {
-    return true;
-  }
-
-  if (!Number.isFinite(nextValue) && !Number.isFinite(currentValue)) {
-    return Boolean(cleanText(nextText || '')) && !Boolean(cleanText(currentText || ''));
-  }
-
-  return false;
 }
 
 async function addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
@@ -1304,11 +1093,11 @@ async function addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, co
   }
 
   try {
-    const response = await fetchWithTimeout('https://www.ubereats.com/_p/api/addMemberToDraftOrderV1', {
+    const response = await fetch('https://www.ubereats.com/_p/api/addMemberToDraftOrderV1', {
       method: 'POST',
       headers: requestHeaders,
       body: JSON.stringify({ draftOrderUuid: draftOrderUUID })
-    }, API_FETCH_TIMEOUT_MS);
+    });
 
     if (!response.ok) {
       return {
@@ -1457,10 +1246,10 @@ function extractItemsFromDraftOrderPayload(payload) {
     return Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : 1;
   };
 
-  const collectCustomizations = (item) => {
-    const entries = [];
+  const collectCustomizationNames = (item) => {
+    const names = [];
     if (!item || typeof item !== 'object' || !item.customizations || typeof item.customizations !== 'object') {
-      return entries;
+      return names;
     }
 
     for (const entry of Object.values(item.customizations)) {
@@ -1476,27 +1265,16 @@ function extractItemsFromDraftOrderPayload(payload) {
         const optionName = cleanText(option.title || option.name || option.label || '');
         const optionQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
         const optionQty = Number(optionQtyRaw);
-        const selected = selectPriceCandidate(option);
-        const optionPriceText = formatPrice(selected.value) || null;
-        const optionUnitValue = parseMoneyToNumber(optionPriceText);
-        const effectiveQty = Number.isFinite(optionQty) && optionQty > 0 ? optionQty : 1;
-        const optionLineValue = Number.isFinite(optionUnitValue)
-          ? Number(((selected.isUnitPrice !== false ? optionUnitValue * effectiveQty : optionUnitValue)).toFixed(2))
-          : null;
 
         if (!optionName || (Number.isFinite(optionQty) && optionQty <= 0) || isLikelyNoiseText(optionName)) {
           continue;
         }
 
-        entries.push({
-          name: optionName,
-          lineValue: Number.isFinite(optionLineValue) ? optionLineValue : null,
-          priceText: optionPriceText
-        });
+        names.push(optionName);
       }
     }
 
-    return entries;
+    return names;
   };
 
   const addBaseItem = (item) => {
@@ -1522,7 +1300,6 @@ function extractItemsFromDraftOrderPayload(payload) {
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
         isUnitPrice: true,
-        modifierLineTotalValue: 0,
         modifiers: new Set()
       };
 
@@ -1554,14 +1331,8 @@ function extractItemsFromDraftOrderPayload(payload) {
       }
     }
 
-    for (const modifier of collectCustomizations(item)) {
-      if (!modifier || !modifier.name) {
-        continue;
-      }
-      record.modifiers.add(modifier.name);
-      if (Number.isFinite(modifier.lineValue) && modifier.lineValue > 0) {
-        record.modifierLineTotalValue += modifier.lineValue;
-      }
+    for (const modifier of collectCustomizationNames(item)) {
+      record.modifiers.add(modifier);
     }
   };
 
@@ -1585,21 +1356,9 @@ function extractItemsFromDraftOrderPayload(payload) {
     const modifiers = Array.from(entry.modifiers.values());
     const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(entry.priceText);
-    let lineTotalValue = Number.isFinite(unitPriceValue)
+    const lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
-    const modifierLineTotalValue = Number.isFinite(Number(entry.modifierLineTotalValue))
-      ? Number(Number(entry.modifierLineTotalValue).toFixed(2))
-      : 0;
-
-    if ((!Number.isFinite(lineTotalValue) || lineTotalValue <= 0) && modifierLineTotalValue > 0) {
-      lineTotalValue = modifierLineTotalValue;
-    }
-
-    const finalUnitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
-      ? Number((lineTotalValue / quantity).toFixed(2))
-      : (Number.isFinite(unitPriceValue) ? unitPriceValue : null);
-
     return {
       name: entry.name,
       quantity,
@@ -1607,9 +1366,9 @@ function extractItemsFromDraftOrderPayload(payload) {
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
       _isUnitPrice: entry.isUnitPrice !== false,
-      _unitPriceValue: Number.isFinite(finalUnitPriceValue) ? finalUnitPriceValue : null,
+      _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
-      _unitPriceText: Number.isFinite(finalUnitPriceValue) ? formatSubtotal(finalUnitPriceValue) : (entry.priceText || null),
+      _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
       _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (entry.priceText || null),
       notes: modifiers.length > 0 ? `Mods: ${modifiers.join(', ')}` : null
     };
