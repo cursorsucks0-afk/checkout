@@ -1133,7 +1133,8 @@ function applyCheckoutPrices(items, priceMap) {
       : item._isUnitPrice !== false;
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
-    const addOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
+    const rawAddOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
+    const addOnsTotalValue = matchedPriceRecord ? 0 : rawAddOnsTotalValue;
     const lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
       : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
@@ -1356,8 +1357,21 @@ function extractItemsFromDraftOrderPayload(payload) {
         const optionName = cleanText(option.title || option.name || option.label || '');
         const optionQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
         const optionQty = Number(optionQtyRaw);
+        const isExplicitlySelected = Boolean(
+          option.selected === true
+          || option.isSelected === true
+          || option.checked === true
+          || option.chosen === true
+          || option.active === true
+        );
+        const hasPositiveQty = Number.isFinite(optionQty) && optionQty > 0;
 
         if (!optionName || (Number.isFinite(optionQty) && optionQty <= 0) || isLikelyNoiseText(optionName)) {
+          continue;
+        }
+
+        // Some payloads include full option catalogs; only count selected options.
+        if (!isExplicitlySelected && !hasPositiveQty) {
           continue;
         }
 
