@@ -97,7 +97,14 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
   const cacheKey = buildGroupOrderCacheKey(parsed.toString());
   const now = Date.now();
   const cached = groupOrderResponseCache.get(cacheKey);
-  if (cached && (now - cached.cachedAt) < GROUP_ORDER_CACHE_TTL_MS) {
+  const cachedLooksSuspicious = Boolean(
+    cached
+    && cached.payload
+    && Number(cached.payload.itemCount || 0) > 0
+    && Number(cached.payload.subtotal || 0) <= 0
+  );
+
+  if (cached && !cachedLooksSuspicious && (now - cached.cachedAt) < GROUP_ORDER_CACHE_TTL_MS) {
     const clone = JSON.parse(JSON.stringify(cached.payload));
     clone.diagnostics = clone.diagnostics || {};
     clone.diagnostics.cacheHit = true;
@@ -132,7 +139,7 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
     const result = extractOrderData(html, resolvedUrl);
     result.diagnostics.authCookieProvided = useAuthCookie;
 
-    if (useAuthCookie && result.itemCount === 0) {
+    if (useAuthCookie && shouldRunDraftFallbackForResult(result)) {
       const draftOrderFallback = await extractItemsWithDraftOrderByUuid(resolvedUrl, effectiveCookie, html);
       result.diagnostics.draftOrderByUuidFallback = {
         attempted: true,
@@ -144,12 +151,18 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       };
 
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
-        result.items = draftOrderFallback.items;
-        result.itemCount = draftOrderFallback.items.length;
-        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
-        result.subtotalText = formatSubtotal(result.subtotal);
-        result.diagnostics.draftOrderByUuidFallback.used = true;
-        result.diagnostics.draftOrderByUuidFallback.reason = null;
+        const shouldUseFallback = shouldUseFallbackItems(result.items, draftOrderFallback.items);
+        if (shouldUseFallback) {
+          result.items = draftOrderFallback.items;
+          result.itemCount = draftOrderFallback.items.length;
+          result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
+          result.subtotalText = formatSubtotal(result.subtotal);
+          result.diagnostics.draftOrderByUuidFallback.used = true;
+          result.diagnostics.draftOrderByUuidFallback.reason = null;
+        } else {
+          result.diagnostics.draftOrderByUuidFallback.used = false;
+          result.diagnostics.draftOrderByUuidFallback.reason = 'existing-item-pricing-preferred';
+        }
       }
     }
 
@@ -168,6 +181,73 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       }
     };
   }
+}
+
+function countPositivePricedItems(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return 0;
+  }
+
+  let count = 0;
+  for (const item of items) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+
+    const lineValue = Number(item._lineTotalValue);
+    const unitValue = Number(item._unitPriceValue);
+    const parsedText = parseMoneyToNumber(item.priceText || item._lineTotalText || item.lineTotalText || '');
+
+    if ((Number.isFinite(lineValue) && lineValue > 0) || (Number.isFinite(unitValue) && unitValue > 0) || (Number.isFinite(parsedText) && parsedText > 0)) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function shouldRunDraftFallbackForResult(result) {
+  const itemCount = Number(result && result.itemCount ? result.itemCount : 0);
+  const subtotal = Number(result && result.subtotal ? result.subtotal : 0);
+  const items = Array.isArray(result && result.items) ? result.items : [];
+  const pricedCount = countPositivePricedItems(items);
+
+  if (itemCount === 0) {
+    return true;
+  }
+
+  if (itemCount > 0 && subtotal <= 0) {
+    return true;
+  }
+
+  if (itemCount > 0 && pricedCount === 0) {
+    return true;
+  }
+
+  return false;
+}
+
+function shouldUseFallbackItems(currentItems, fallbackItems) {
+  const currentList = Array.isArray(currentItems) ? currentItems : [];
+  const fallbackList = Array.isArray(fallbackItems) ? fallbackItems : [];
+
+  if (currentList.length === 0 && fallbackList.length > 0) {
+    return true;
+  }
+
+  const currentPriced = countPositivePricedItems(currentList);
+  const fallbackPriced = countPositivePricedItems(fallbackList);
+  if (fallbackPriced > currentPriced) {
+    return true;
+  }
+
+  const currentSubtotal = calculateSubtotalFromItems(currentList);
+  const fallbackSubtotal = calculateSubtotalFromItems(fallbackList);
+  if (fallbackPriced === currentPriced && fallbackSubtotal > (currentSubtotal + 0.01)) {
+    return true;
+  }
+
+  return false;
 }
 
 function buildGroupOrderCacheKey(inputUrl) {
@@ -197,6 +277,11 @@ function buildGroupOrderCacheKey(inputUrl) {
 
 function setCachedGroupOrderResponse(cacheKey, payload) {
   if (!cacheKey || !payload || typeof payload !== 'object') {
+    return;
+  }
+
+  const looksSuspicious = Number(payload.itemCount || 0) > 0 && Number(payload.subtotal || 0) <= 0;
+  if (looksSuspicious) {
     return;
   }
 
@@ -947,8 +1032,14 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
       }
       const hasLineValue = Number.isFinite(Number(item._lineTotalValue));
       const hasUnitValue = Number.isFinite(Number(item._unitPriceValue));
-      const hasPriceText = Boolean(cleanText(item.priceText || ''));
-      return !(hasLineValue || hasUnitValue || hasPriceText);
+      const parsedTextPrice = parseMoneyToNumber(item.priceText || '');
+      const hasPositiveLine = hasLineValue && Number(item._lineTotalValue) > 0;
+      const hasPositiveUnit = hasUnitValue && Number(item._unitPriceValue) > 0;
+      const hasPositiveText = Number.isFinite(parsedTextPrice) && parsedTextPrice > 0;
+
+      // Zero-dollar placeholders are common for base items priced by add-ons;
+      // force checkout enrichment in those cases so line totals are accurate.
+      return !(hasPositiveLine || hasPositiveUnit || hasPositiveText);
     });
 
     let pricedItems = extractedItems;
@@ -1074,13 +1165,19 @@ function extractCheckoutPriceMap(payload) {
 
     if (candidatePrice && candidateName) {
       const key = `${candidateName.toLowerCase()}::${candidateQty}`;
-      if (!byNameQty.has(key)) {
-        byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+      const nextRecord = { priceText: candidatePrice, isUnitPrice: candidateIsUnit };
+      const existingRecord = byNameQty.get(key);
+      if (!existingRecord || shouldPreferPriceRecord(nextRecord, existingRecord)) {
+        byNameQty.set(key, nextRecord);
       }
     }
 
-    if (candidatePrice && candidateId && !byId.has(candidateId)) {
-      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+    if (candidatePrice && candidateId) {
+      const nextRecord = { priceText: candidatePrice, isUnitPrice: candidateIsUnit };
+      const existingRecord = byId.get(candidateId);
+      if (!existingRecord || shouldPreferPriceRecord(nextRecord, existingRecord)) {
+        byId.set(candidateId, nextRecord);
+      }
     }
 
     for (const child of Object.values(value)) {
@@ -1112,11 +1209,25 @@ function applyCheckoutPrices(items, priceMap) {
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
-    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
+    const matchedIsUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.isUnitPrice !== false
       : item._isUnitPrice !== false;
+
+    const existingRecord = {
+      priceText: item.priceText || null,
+      isUnitPrice: item._isUnitPrice !== false
+    };
+    const nextRecord = {
+      priceText: matchedPrice || null,
+      isUnitPrice: matchedIsUnitPrice
+    };
+    const useMatchedRecord = shouldPreferPriceRecord(nextRecord, existingRecord);
+    const selectedPriceText = useMatchedRecord
+      ? (matchedPrice || item.priceText || null)
+      : (item.priceText || matchedPrice || null);
+    const isUnitPrice = useMatchedRecord ? matchedIsUnitPrice : (item._isUnitPrice !== false);
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
+    const unitPriceValue = parseMoneyToNumber(selectedPriceText);
     const lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
@@ -1125,15 +1236,43 @@ function applyCheckoutPrices(items, priceMap) {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
-      priceText: matchedPrice || item.priceText || null,
+      priceText: selectedPriceText,
       isUnitPrice,
-      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
-      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : selectedPriceText,
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : selectedPriceText,
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       notes: item.notes || null
     };
   });
+}
+
+function shouldPreferPriceRecord(nextRecord, currentRecord) {
+  const nextText = nextRecord && typeof nextRecord === 'object' ? nextRecord.priceText : null;
+  const currentText = currentRecord && typeof currentRecord === 'object' ? currentRecord.priceText : null;
+  const nextValue = parseMoneyToNumber(nextText);
+  const currentValue = parseMoneyToNumber(currentText);
+
+  const nextPositive = Number.isFinite(nextValue) && nextValue > 0;
+  const currentPositive = Number.isFinite(currentValue) && currentValue > 0;
+
+  if (nextPositive && !currentPositive) {
+    return true;
+  }
+
+  if (nextPositive && currentPositive && nextValue > (currentValue + 0.009)) {
+    return true;
+  }
+
+  if (Number.isFinite(nextValue) && !Number.isFinite(currentValue)) {
+    return true;
+  }
+
+  if (!Number.isFinite(nextValue) && !Number.isFinite(currentValue)) {
+    return Boolean(cleanText(nextText || '')) && !Boolean(cleanText(currentText || ''));
+  }
+
+  return false;
 }
 
 async function addMemberToDraftOrder(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
@@ -1318,10 +1457,10 @@ function extractItemsFromDraftOrderPayload(payload) {
     return Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : 1;
   };
 
-  const collectCustomizationNames = (item) => {
-    const names = [];
+  const collectCustomizations = (item) => {
+    const entries = [];
     if (!item || typeof item !== 'object' || !item.customizations || typeof item.customizations !== 'object') {
-      return names;
+      return entries;
     }
 
     for (const entry of Object.values(item.customizations)) {
@@ -1337,16 +1476,27 @@ function extractItemsFromDraftOrderPayload(payload) {
         const optionName = cleanText(option.title || option.name || option.label || '');
         const optionQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
         const optionQty = Number(optionQtyRaw);
+        const selected = selectPriceCandidate(option);
+        const optionPriceText = formatPrice(selected.value) || null;
+        const optionUnitValue = parseMoneyToNumber(optionPriceText);
+        const effectiveQty = Number.isFinite(optionQty) && optionQty > 0 ? optionQty : 1;
+        const optionLineValue = Number.isFinite(optionUnitValue)
+          ? Number(((selected.isUnitPrice !== false ? optionUnitValue * effectiveQty : optionUnitValue)).toFixed(2))
+          : null;
 
         if (!optionName || (Number.isFinite(optionQty) && optionQty <= 0) || isLikelyNoiseText(optionName)) {
           continue;
         }
 
-        names.push(optionName);
+        entries.push({
+          name: optionName,
+          lineValue: Number.isFinite(optionLineValue) ? optionLineValue : null,
+          priceText: optionPriceText
+        });
       }
     }
 
-    return names;
+    return entries;
   };
 
   const addBaseItem = (item) => {
@@ -1372,6 +1522,7 @@ function extractItemsFromDraftOrderPayload(payload) {
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
         isUnitPrice: true,
+        modifierLineTotalValue: 0,
         modifiers: new Set()
       };
 
@@ -1403,8 +1554,14 @@ function extractItemsFromDraftOrderPayload(payload) {
       }
     }
 
-    for (const modifier of collectCustomizationNames(item)) {
-      record.modifiers.add(modifier);
+    for (const modifier of collectCustomizations(item)) {
+      if (!modifier || !modifier.name) {
+        continue;
+      }
+      record.modifiers.add(modifier.name);
+      if (Number.isFinite(modifier.lineValue) && modifier.lineValue > 0) {
+        record.modifierLineTotalValue += modifier.lineValue;
+      }
     }
   };
 
@@ -1428,9 +1585,21 @@ function extractItemsFromDraftOrderPayload(payload) {
     const modifiers = Array.from(entry.modifiers.values());
     const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(entry.priceText);
-    const lineTotalValue = Number.isFinite(unitPriceValue)
+    let lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
       : null;
+    const modifierLineTotalValue = Number.isFinite(Number(entry.modifierLineTotalValue))
+      ? Number(Number(entry.modifierLineTotalValue).toFixed(2))
+      : 0;
+
+    if ((!Number.isFinite(lineTotalValue) || lineTotalValue <= 0) && modifierLineTotalValue > 0) {
+      lineTotalValue = modifierLineTotalValue;
+    }
+
+    const finalUnitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
+      ? Number((lineTotalValue / quantity).toFixed(2))
+      : (Number.isFinite(unitPriceValue) ? unitPriceValue : null);
+
     return {
       name: entry.name,
       quantity,
@@ -1438,9 +1607,9 @@ function extractItemsFromDraftOrderPayload(payload) {
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
       _isUnitPrice: entry.isUnitPrice !== false,
-      _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
+      _unitPriceValue: Number.isFinite(finalUnitPriceValue) ? finalUnitPriceValue : null,
       _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
-      _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
+      _unitPriceText: Number.isFinite(finalUnitPriceValue) ? formatSubtotal(finalUnitPriceValue) : (entry.priceText || null),
       _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (entry.priceText || null),
       notes: modifiers.length > 0 ? `Mods: ${modifiers.join(', ')}` : null
     };
