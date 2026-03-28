@@ -1441,6 +1441,36 @@ function extractItemsFromDraftOrderPayload(payload) {
     return Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : 1;
   };
 
+  const selectModifierPriceCandidate = (option) => {
+    if (!option || typeof option !== 'object') {
+      return { value: null, isUnitPrice: true };
+    }
+
+    // Modifier payloads often expose both base and rolled-up fields.
+    // Prefer direct per-option fields first to avoid subtotal-style inflation.
+    if (option.unitPrice != null) {
+      return { value: option.unitPrice, isUnitPrice: true };
+    }
+
+    if (option.price != null) {
+      return { value: option.price, isUnitPrice: true };
+    }
+
+    if (option.amount != null) {
+      return { value: option.amount, isUnitPrice: true };
+    }
+
+    if (option.totalPrice != null) {
+      return { value: option.totalPrice, isUnitPrice: false };
+    }
+
+    if (option.subtotal != null) {
+      return { value: option.subtotal, isUnitPrice: false };
+    }
+
+    return { value: null, isUnitPrice: true };
+  };
+
   const collectCustomizationDetails = (item) => {
     const details = [];
     if (!item || typeof item !== 'object' || !item.customizations || typeof item.customizations !== 'object') {
@@ -1519,11 +1549,11 @@ function extractItemsFromDraftOrderPayload(payload) {
           }
         }
 
-        const selected = selectPriceCandidate(option);
+        const selected = selectModifierPriceCandidate(option);
         const priceText = formatPrice(selected.value) || null;
         const unitPriceValue = parseMoneyToNumber(priceText);
         const linePriceValue = Number.isFinite(unitPriceValue)
-          ? Number((unitPriceValue * normalizedQty).toFixed(2))
+          ? Number(((selected.isUnitPrice === false ? unitPriceValue : unitPriceValue * normalizedQty)).toFixed(2))
           : null;
 
         const label = Number.isFinite(linePriceValue)
@@ -1607,6 +1637,10 @@ function extractItemsFromDraftOrderPayload(payload) {
       const baseName = cleanText(record.name || '').toLowerCase();
       const recordPriceValue = parseMoneyToNumber(record.priceText);
       const baseIsUnsetOrZero = !Number.isFinite(recordPriceValue) || recordPriceValue <= 0;
+      const qtyForUnit = Number.isFinite(Number(record.quantity)) && Number(record.quantity) > 0 ? Number(record.quantity) : 1;
+      const baseLineFromRecord = Number.isFinite(recordPriceValue)
+        ? Number((recordPriceValue * qtyForUnit).toFixed(2))
+        : null;
       const looksLikeEmbeddedBasePrice =
         baseIsUnsetOrZero
         && modifierName
@@ -1615,11 +1649,23 @@ function extractItemsFromDraftOrderPayload(payload) {
         && Number.isFinite(modifier.linePriceValue)
         && modifier.linePriceValue > 0;
 
+      const looksLikeDuplicateBaseModifier =
+        !baseIsUnsetOrZero
+        && modifierName
+        && baseName
+        && modifierName === baseName
+        && Number.isFinite(modifier.linePriceValue)
+        && Number.isFinite(baseLineFromRecord)
+        && Math.abs(modifier.linePriceValue - baseLineFromRecord) <= 0.01;
+
       if (looksLikeEmbeddedBasePrice) {
-        const qtyForUnit = Number.isFinite(Number(record.quantity)) && Number(record.quantity) > 0 ? Number(record.quantity) : 1;
         const inferredUnitPrice = Number((modifier.linePriceValue / qtyForUnit).toFixed(2));
         record.priceText = formatSubtotal(inferredUnitPrice);
         record.isUnitPrice = true;
+        continue;
+      }
+
+      if (looksLikeDuplicateBaseModifier) {
         continue;
       }
 
