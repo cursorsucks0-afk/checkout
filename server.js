@@ -126,9 +126,7 @@ async function handleGroupOrderRequest(rawUrl, cookieHeader) {
       if (draftOrderFallback.ok && Array.isArray(draftOrderFallback.items) && draftOrderFallback.items.length > 0) {
         result.items = draftOrderFallback.items;
         result.itemCount = draftOrderFallback.items.length;
-        result.subtotal = Number.isFinite(draftOrderFallback.subtotal)
-          ? draftOrderFallback.subtotal
-          : calculateSubtotalFromItems(draftOrderFallback.items);
+        result.subtotal = calculateSubtotalFromItems(draftOrderFallback.items);
         result.subtotalText = formatSubtotal(result.subtotal);
         result.diagnostics.draftOrderByUuidFallback.used = true;
         result.diagnostics.draftOrderByUuidFallback.reason = null;
@@ -222,13 +220,11 @@ function extractOrderData(html, sourceUrl) {
     name: item.name,
     quantity: item.quantity,
     priceText: item.priceText || null,
-    isUnitPrice: item._isUnitPrice !== false,
+    isUnitPrice: false,
     unitPriceText: item._unitPriceText || null,
     lineTotalText: item._lineTotalText || item.priceText || null,
     unitPriceValue: Number.isFinite(item._unitPriceValue) ? item._unitPriceValue : null,
     lineTotalValue: Number.isFinite(item._lineTotalValue) ? item._lineTotalValue : null,
-    addOnsTotalText: Number.isFinite(item._addOnsTotalValue) ? formatSubtotal(item._addOnsTotalValue) : null,
-    addOnsTotalValue: Number.isFinite(item._addOnsTotalValue) ? item._addOnsTotalValue : null,
     imageUrl: item.imageUrl || null,
     notes: item.notes || null
   }));
@@ -541,23 +537,19 @@ function normalizeItem(candidate) {
 
   const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
 
-  const selectedPrice = selectPriceCandidate(candidate);
-  const priceCandidate = selectedPrice.value;
+  const priceCandidate = selectPriceCandidate(candidate);
 
   const priceText = formatPrice(priceCandidate);
-  const priceValue = parseMoneyToNumber(priceText);
-  const isUnitPrice = selectedPrice.isUnitPrice !== false;
-  const unitPriceValue = Number.isFinite(priceValue) ? priceValue : null;
-  const lineTotalValue = Number.isFinite(priceValue)
-    ? Number(((isUnitPrice ? priceValue * quantity : priceValue)).toFixed(2))
+  const lineTotalValue = parseMoneyToNumber(priceText);
+  const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
+    ? Number((lineTotalValue / quantity).toFixed(2))
     : null;
 
   return {
     name,
     quantity,
     priceText,
-    _priceValue: unitPriceValue,
-    _isUnitPrice: isUnitPrice,
+    _priceValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
     _unitPriceValue: unitPriceValue,
     _lineTotalValue: lineTotalValue,
     _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : priceText,
@@ -568,73 +560,26 @@ function normalizeItem(candidate) {
 
 function selectPriceCandidate(candidate) {
   if (candidate.totalPrice != null) {
-    return { value: candidate.totalPrice, isUnitPrice: false };
+    return candidate.totalPrice;
   }
 
   if (candidate.subtotal != null) {
-    return { value: candidate.subtotal, isUnitPrice: false };
+    return candidate.subtotal;
   }
 
   if (candidate.amount != null) {
-    return { value: candidate.amount, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.amount) };
+    return candidate.amount;
   }
 
   if (candidate.price != null) {
-    return { value: candidate.price, isUnitPrice: inferUnitPriceFromCandidate(candidate, candidate.price) };
+    return candidate.price;
   }
 
   if (candidate.unitPrice != null) {
-    return { value: candidate.unitPrice, isUnitPrice: true };
+    return candidate.unitPrice;
   }
 
-  return { value: null, isUnitPrice: false };
-}
-
-function inferUnitPriceFromCandidate(candidate, rawPrice) {
-  const quantityRaw =
-    candidate.quantity ??
-    candidate.qty ??
-    candidate.count ??
-    candidate.itemQuantity ??
-    candidate.units ??
-    candidate.numItems;
-  const quantity = Number.isFinite(Number(quantityRaw)) ? Number(quantityRaw) : 1;
-
-  const explicitTotalKeys = [
-    'lineTotal',
-    'lineAmount',
-    'extendedPrice',
-    'itemTotal',
-    'total',
-    'subtotal'
-  ];
-
-  for (const key of explicitTotalKeys) {
-    if (candidate[key] != null) {
-      return false;
-    }
-  }
-
-  const normalizedText = String(
-    (rawPrice && typeof rawPrice === 'object' && (rawPrice.displayString || rawPrice.formattedPrice || rawPrice.displayPrice))
-      || rawPrice
-      || ''
-  ).toLowerCase();
-
-  if (normalizedText.includes('each') || normalizedText.includes('ea')) {
-    return true;
-  }
-
-  if (normalizedText.includes('total') || normalizedText.includes('subtotal')) {
-    return false;
-  }
-
-  // Generic price fields on item records are most often unit prices.
-  if (quantity > 1) {
-    return true;
-  }
-
-  return true;
+  return null;
 }
 
 function calculateSubtotalFromItems(items) {
@@ -657,14 +602,13 @@ function calculateSubtotalFromItems(items) {
       continue;
     }
 
-    const parsedAmount = Number.isFinite(item._priceValue) ? item._priceValue : parseMoneyToNumber(item.priceText);
+    const parsedAmount = Number.isFinite(item._priceValue)
+      ? item._priceValue
+      : parseMoneyToNumber(item.priceText || item._lineTotalText || item.lineTotalText || null);
     if (!Number.isFinite(parsedAmount)) {
       continue;
     }
-
-    const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const lineAmount = item._isUnitPrice ? parsedAmount * quantity : parsedAmount;
-    subtotal += lineAmount;
+    subtotal += parsedAmount;
   }
 
   return Number(subtotal.toFixed(2));
@@ -866,39 +810,32 @@ async function extractItemsWithDraftOrderByUuid(sourceUrl, cookieHeader, html) {
     }
 
     const extractedItems = extractItemsFromDraftOrderPayload(json);
-    const checkoutData = await fetchCheckoutPresentationData(
+    const checkoutPrices = await fetchCheckoutPresentationPriceMap(
       sourceUrl,
       cookieHeader,
       draftOrderUUID,
       cookieMap,
       loc
     );
-    const pricedItems = applyCheckoutPrices(extractedItems, checkoutData.priceMap);
-    const computedSubtotal = calculateSubtotalFromItems(pricedItems);
-    const checkoutSubtotal = Number.isFinite(checkoutData.subtotal) ? Number(checkoutData.subtotal) : null;
-    const shouldTrustCheckoutSubtotal = Number.isFinite(checkoutSubtotal)
-      && Number.isFinite(computedSubtotal)
-      && Math.abs(checkoutSubtotal - computedSubtotal) <= 0.5;
+    const pricedItems = applyCheckoutPrices(extractedItems, checkoutPrices);
 
     return {
       ok: true,
       reason: pricedItems.length > 0 ? null : 'draft-order-no-item-names',
       autoJoin,
-      items: pricedItems,
-      subtotal: shouldTrustCheckoutSubtotal ? checkoutSubtotal : computedSubtotal
+      items: pricedItems
     };
   } catch (error) {
     return {
       ok: false,
       reason: error instanceof Error ? error.message : String(error),
       autoJoin,
-      items: [],
-      subtotal: null
+      items: []
     };
   }
 }
 
-async function fetchCheckoutPresentationData(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
+async function fetchCheckoutPresentationPriceMap(sourceUrl, cookieHeader, draftOrderUUID, cookieMap, loc) {
   const requestHeaders = {
     accept: '*/*',
     'accept-language': 'en-US,en;q=0.9',
@@ -964,10 +901,7 @@ async function fetchCheckoutPresentationData(sourceUrl, cookieHeader, draftOrder
     });
 
     if (!response.ok) {
-      return {
-        priceMap: { byId: new Map(), byNameQty: new Map() },
-        subtotal: null
-      };
+      return { byId: new Map() };
     }
 
     const text = await response.text();
@@ -975,96 +909,17 @@ async function fetchCheckoutPresentationData(sourceUrl, cookieHeader, draftOrder
     try {
       json = JSON.parse(text);
     } catch {
-      return {
-        priceMap: { byId: new Map(), byNameQty: new Map() },
-        subtotal: null
-      };
+      return { byId: new Map() };
     }
 
-    return {
-      priceMap: extractCheckoutPriceMap(json),
-      subtotal: extractCheckoutSubtotal(json)
-    };
+    return extractCheckoutPriceMap(json);
   } catch {
-    return {
-      priceMap: { byId: new Map(), byNameQty: new Map() },
-      subtotal: null
-    };
+    return { byId: new Map() };
   }
-}
-
-function extractCheckoutSubtotal(payload) {
-  const candidates = [];
-
-  const pushCandidate = (rawValue, weight, path) => {
-    const parsed = parseMoneyToNumber(formatPrice(rawValue) || rawValue);
-    if (!Number.isFinite(parsed)) {
-      return;
-    }
-    if (parsed < 0 || parsed > 20000) {
-      return;
-    }
-    candidates.push({ value: Number(parsed.toFixed(2)), weight, path: String(path || '') });
-  };
-
-  const walk = (value, path = '') => {
-    if (!value) {
-      return;
-    }
-
-    if (Array.isArray(value)) {
-      value.forEach((entry, idx) => walk(entry, `${path}[${idx}]`));
-      return;
-    }
-
-    if (typeof value !== 'object') {
-      return;
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      const keyLower = String(key).toLowerCase();
-      const nextPath = path ? `${path}.${key}` : key;
-
-      if (keyLower === 'subtotal' || keyLower === 'sub_total' || keyLower === 'subtotalamount') {
-        pushCandidate(child, 100, nextPath);
-      }
-
-      if (typeof child === 'string' && keyLower.includes('subtotal')) {
-        pushCandidate(child, 70, nextPath);
-      }
-
-      if (child && typeof child === 'object') {
-        if (keyLower.includes('subtotal')) {
-          if (child.amount != null) pushCandidate(child.amount, 90, `${nextPath}.amount`);
-          if (child.value != null) pushCandidate(child.value, 90, `${nextPath}.value`);
-          if (child.displayString != null) pushCandidate(child.displayString, 80, `${nextPath}.displayString`);
-          if (child.formattedPrice != null) pushCandidate(child.formattedPrice, 80, `${nextPath}.formattedPrice`);
-          if (child.displayPrice != null) pushCandidate(child.displayPrice, 80, `${nextPath}.displayPrice`);
-        }
-
-        walk(child, nextPath);
-      }
-    }
-  };
-
-  walk(payload);
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  candidates.sort((a, b) => {
-    if (b.weight !== a.weight) return b.weight - a.weight;
-    return b.value - a.value;
-  });
-
-  return candidates[0].value;
 }
 
 function extractCheckoutPriceMap(payload) {
   const byId = new Map();
-  const byNameQty = new Map();
-  const ambiguousNameQtyKeys = new Set();
 
   const walk = (value) => {
     if (!value) {
@@ -1082,30 +937,14 @@ function extractCheckoutPriceMap(payload) {
       return;
     }
 
-    const candidateName = cleanText(value.title || value.name || value.itemName || value.displayName || value.label || '');
-    const candidateQtyRaw = value.quantity ?? value.qty ?? value.count ?? value.itemQuantity ?? null;
-    const candidateQty = Number.isFinite(Number(candidateQtyRaw)) && Number(candidateQtyRaw) > 0 ? Number(candidateQtyRaw) : 1;
     const selected = selectPriceCandidate(value);
-    const candidatePrice = formatPrice(selected.value) || null;
-    const candidateIsUnit = selected.isUnitPrice !== false;
+    const candidatePrice = formatPrice(selected) || null;
     const candidateId = cleanText(
       value.shoppingCartItemUuid || value.shoppingCartItemUUID || value.itemUuid || value.itemUUID || value.uuid || ''
     );
 
-    if (candidatePrice && candidateName) {
-      const key = `${candidateName.toLowerCase()}::${candidateQty}`;
-      if (ambiguousNameQtyKeys.has(key)) {
-        // Keep ambiguous keys disabled.
-      } else if (!byNameQty.has(key)) {
-        byNameQty.set(key, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
-      } else {
-        ambiguousNameQtyKeys.add(key);
-        byNameQty.delete(key);
-      }
-    }
-
     if (candidatePrice && candidateId && !byId.has(candidateId)) {
-      byId.set(candidateId, { priceText: candidatePrice, isUnitPrice: candidateIsUnit });
+      byId.set(candidateId, { priceText: candidatePrice });
     }
 
     for (const child of Object.values(value)) {
@@ -1115,7 +954,7 @@ function extractCheckoutPriceMap(payload) {
 
   walk(payload);
 
-  return { byId, byNameQty };
+  return { byId };
 }
 
 function applyCheckoutPrices(items, priceMap) {
@@ -1124,75 +963,36 @@ function applyCheckoutPrices(items, priceMap) {
   }
 
   const byId = priceMap && priceMap.byId instanceof Map ? priceMap.byId : new Map();
-  const byNameQty = priceMap && priceMap.byNameQty instanceof Map ? priceMap.byNameQty : new Map();
+  const hasCheckoutPriceMap = byId.size > 0;
 
   return items.map((item) => {
-    const normalizedName = cleanText(item.name || '').toLowerCase();
-    const itemKey = `${normalizedName}::${Number(item.quantity) || 1}`;
-
-    // Prefer strict cart-item UUID matching; fallback to unambiguous name+qty when needed.
-    const matchedById = (item._itemId && byId.get(item._itemId)) || null;
-    const matchedByNameQty = byNameQty.get(itemKey) || null;
-    const matchedPriceRecord = matchedById || matchedByNameQty || null;
+    const matchedPriceRecord = item._itemId ? byId.get(item._itemId) : null;
     const matchedPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
       ? matchedPriceRecord.priceText
       : matchedPriceRecord;
-    const isUnitPrice = matchedPriceRecord && typeof matchedPriceRecord === 'object'
-      ? matchedPriceRecord.isUnitPrice !== false
-      : item._isUnitPrice !== false;
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
-    const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
-    const rawAddOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
 
-    const draftUnitPriceValue = parseMoneyToNumber(item.priceText);
-    const draftBaseLineValue = Number.isFinite(draftUnitPriceValue)
-      ? Number(((item._isUnitPrice !== false ? draftUnitPriceValue * quantity : draftUnitPriceValue)).toFixed(2))
+    // Safety guard: when checkout map exists, disable all fallback matching logic.
+    const effectivePriceText = hasCheckoutPriceMap
+      ? (matchedPrice || item._lineTotalText || item.priceText || null)
+      : (matchedPrice || item._lineTotalText || item.priceText || null);
+
+    const lineTotalValue = parseMoneyToNumber(effectivePriceText);
+    const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
+      ? Number((lineTotalValue / quantity).toFixed(2))
       : null;
-    const matchedLineValue = Number.isFinite(unitPriceValue)
-      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
-      : null;
-
-    // Checkout price can be either base-only or already include modifiers depending on payload shape.
-    // If matched line is near draft base line, keep draft add-ons; otherwise assume checkout already includes them.
-    let addOnsTotalValue = rawAddOnsTotalValue;
-    if (matchedPriceRecord && rawAddOnsTotalValue > 0 && Number.isFinite(matchedLineValue) && Number.isFinite(draftBaseLineValue)) {
-      const deltaToDraftBase = Math.abs(matchedLineValue - draftBaseLineValue);
-      const deltaToDraftWithAddOns = Math.abs(matchedLineValue - (draftBaseLineValue + rawAddOnsTotalValue));
-      addOnsTotalValue = deltaToDraftBase <= deltaToDraftWithAddOns ? rawAddOnsTotalValue : 0;
-    } else if (matchedPriceRecord && rawAddOnsTotalValue > 0 && !Number.isFinite(draftBaseLineValue)) {
-      addOnsTotalValue = 0;
-    }
-
-    const lineTotalValue = Number.isFinite(unitPriceValue)
-      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
-      : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
 
     return {
       name: item.name,
       quantity: item.quantity,
       imageUrl: item.imageUrl || null,
-      priceText: matchedPrice || item.priceText || null,
-      isUnitPrice,
-      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (matchedPrice || item.priceText || null),
-      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (matchedPrice || item.priceText || null),
+      priceText: effectivePriceText,
+      isUnitPrice: false,
+      unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (item._unitPriceText || item.priceText || null),
+      lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (effectivePriceText || item._lineTotalText || item.priceText || null),
       unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
       lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
-      addOnsTotalText: addOnsTotalValue > 0 ? formatSubtotal(addOnsTotalValue) : null,
-      addOnsTotalValue: addOnsTotalValue > 0 ? addOnsTotalValue : null,
-      notes: item.notes || null,
-      pricingSource: matchedById ? 'checkout-by-id' : (matchedByNameQty ? 'checkout-by-name-qty' : 'draft-order'),
-      pricingDebug: {
-        quantity,
-        matchedById: Boolean(matchedById),
-        matchedByNameQty: Boolean(matchedByNameQty),
-        matchedPriceText: matchedPrice || null,
-        draftPriceText: item.priceText || null,
-        draftBaseLineValue: Number.isFinite(draftBaseLineValue) ? draftBaseLineValue : null,
-        matchedLineValue: Number.isFinite(matchedLineValue) ? matchedLineValue : null,
-        rawAddOnsTotalValue: Number(rawAddOnsTotalValue.toFixed(2)),
-        appliedAddOnsTotalValue: Number(addOnsTotalValue.toFixed(2)),
-        isUnitPrice
-      }
+      notes: item.notes || null
     };
   });
 }
@@ -1379,10 +1179,10 @@ function extractItemsFromDraftOrderPayload(payload) {
     return Number.isFinite(parsedQty) && parsedQty > 0 ? parsedQty : 1;
   };
 
-  const collectCustomizationDetails = (item) => {
-    const details = [];
+  const collectCustomizationNames = (item) => {
+    const names = [];
     if (!item || typeof item !== 'object' || !item.customizations || typeof item.customizations !== 'object') {
-      return details;
+      return names;
     }
 
     for (const entry of Object.values(item.customizations)) {
@@ -1390,84 +1190,24 @@ function extractItemsFromDraftOrderPayload(payload) {
         continue;
       }
 
-      const groupHasSelectionSignals = entry.some((option) => {
-        if (!option || typeof option !== 'object') {
-          return false;
-        }
-
-        const selectedQtyRaw = option.selectedQuantity ?? option.selectedQty ?? null;
-        const selectedQty = Number(selectedQtyRaw);
-        return Boolean(
-          option.selected === true
-          || option.isSelected === true
-          || option.isChosen === true
-          || option.checked === true
-          || option.is_checked === true
-          || (Number.isFinite(selectedQty) && selectedQty > 0)
-        );
-      });
-
       for (const option of entry) {
         if (!option || typeof option !== 'object') {
           continue;
         }
 
         const optionName = cleanText(option.title || option.name || option.label || '');
-        const selectedQtyRaw = option.selectedQuantity ?? option.selectedQty ?? null;
-        const selectedQty = Number(selectedQtyRaw);
-        const fallbackQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
-        const fallbackQty = Number(fallbackQtyRaw);
-        const isExplicitlySelected = Boolean(
-          option.selected === true
-          || option.isSelected === true
-          || option.isChosen === true
-          || option.checked === true
-          || option.is_checked === true
-        );
-        const hasSelectedQty = Number.isFinite(selectedQty) && selectedQty > 0;
-        const hasPositiveFallbackQty = Number.isFinite(fallbackQty) && fallbackQty > 0;
+        const optionQtyRaw = option.quantity ?? option.qty ?? option.count ?? null;
+        const optionQty = Number(optionQtyRaw);
 
-        if (!optionName || isLikelyNoiseText(optionName)) {
+        if (!optionName || (Number.isFinite(optionQty) && optionQty <= 0) || isLikelyNoiseText(optionName)) {
           continue;
         }
 
-        // If this group exposes explicit selection signals, trust only those signals.
-        // Otherwise, treat positive generic quantity as selected (selected-only payload shape).
-        const isSelected = groupHasSelectionSignals
-          ? (isExplicitlySelected || hasSelectedQty)
-          : (isExplicitlySelected || hasSelectedQty || hasPositiveFallbackQty);
-
-        if (!isSelected) {
-          continue;
-        }
-
-        let normalizedQty = 1;
-        if (hasSelectedQty) {
-          normalizedQty = selectedQty;
-        } else if (hasPositiveFallbackQty) {
-          normalizedQty = fallbackQty;
-        }
-
-        const selected = selectPriceCandidate(option);
-        const priceText = formatPrice(selected.value) || null;
-        const unitPriceValue = parseMoneyToNumber(priceText);
-        const linePriceValue = Number.isFinite(unitPriceValue)
-          ? Number((unitPriceValue * normalizedQty).toFixed(2))
-          : null;
-
-        const label = Number.isFinite(linePriceValue)
-          ? `${optionName} (+${formatSubtotal(linePriceValue)})`
-          : optionName;
-
-        details.push({
-          key: `${optionName.toLowerCase()}::${normalizedQty}::${priceText || ''}`,
-          label,
-          linePriceValue
-        });
+        names.push(optionName);
       }
     }
 
-    return details;
+    return names;
   };
 
   const addBaseItem = (item) => {
@@ -1492,17 +1232,13 @@ function extractItemsFromDraftOrderPayload(payload) {
         itemId: itemId || null,
         imageUrl: cleanText(item.imageURL || item.imageUrl || item.image_url || ''),
         priceText: null,
-        isUnitPrice: true,
-        modifiers: new Set(),
-        modifierKeys: new Set(),
-        addOnsTotalValue: 0
+        modifiers: new Set()
       };
 
       const selected = selectPriceCandidate(item);
-      const selectedPriceText = formatPrice(selected.value) || null;
+      const selectedPriceText = formatPrice(selected) || null;
       if (selectedPriceText) {
         record.priceText = selectedPriceText;
-        record.isUnitPrice = selected.isUnitPrice !== false;
       }
 
       byKey.set(key, record);
@@ -1519,23 +1255,14 @@ function extractItemsFromDraftOrderPayload(payload) {
 
     if (!record.priceText) {
       const selected = selectPriceCandidate(item);
-      const candidatePriceText = formatPrice(selected.value);
+      const candidatePriceText = formatPrice(selected);
       if (candidatePriceText) {
         record.priceText = candidatePriceText;
-        record.isUnitPrice = selected.isUnitPrice !== false;
       }
     }
 
-    for (const modifier of collectCustomizationDetails(item)) {
-      if (!modifier || !modifier.key || record.modifierKeys.has(modifier.key)) {
-        continue;
-      }
-
-      record.modifierKeys.add(modifier.key);
-      record.modifiers.add(modifier.label);
-      if (Number.isFinite(modifier.linePriceValue)) {
-        record.addOnsTotalValue = Number((record.addOnsTotalValue + modifier.linePriceValue).toFixed(2));
-      }
+    for (const modifier of collectCustomizationNames(item)) {
+      record.modifiers.add(modifier);
     }
   };
 
@@ -1558,23 +1285,18 @@ function extractItemsFromDraftOrderPayload(payload) {
   return Array.from(byKey.values()).map((entry) => {
     const modifiers = Array.from(entry.modifiers.values());
     const quantity = Number.isFinite(Number(entry.quantity)) && Number(entry.quantity) > 0 ? Number(entry.quantity) : 1;
-    const unitPriceValue = parseMoneyToNumber(entry.priceText);
-    const baseLineTotalValue = Number.isFinite(unitPriceValue)
-      ? Number(((entry.isUnitPrice !== false ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
+    const lineTotalValue = parseMoneyToNumber(entry.priceText);
+    const unitPriceValue = Number.isFinite(lineTotalValue) && quantity > 0
+      ? Number((lineTotalValue / quantity).toFixed(2))
       : null;
-    const addOnsTotalValue = Number.isFinite(entry.addOnsTotalValue) ? entry.addOnsTotalValue : 0;
-    const lineTotalValue = Number.isFinite(baseLineTotalValue)
-      ? Number((baseLineTotalValue + addOnsTotalValue).toFixed(2))
-      : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
     return {
       name: entry.name,
       quantity,
       _itemId: entry.itemId || null,
       imageUrl: entry.imageUrl || null,
       priceText: entry.priceText || null,
-      _isUnitPrice: entry.isUnitPrice !== false,
+      _isUnitPrice: false,
       _unitPriceValue: Number.isFinite(unitPriceValue) ? unitPriceValue : null,
-      _addOnsTotalValue: addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null,
       _lineTotalValue: Number.isFinite(lineTotalValue) ? lineTotalValue : null,
       _unitPriceText: Number.isFinite(unitPriceValue) ? formatSubtotal(unitPriceValue) : (entry.priceText || null),
       _lineTotalText: Number.isFinite(lineTotalValue) ? formatSubtotal(lineTotalValue) : (entry.priceText || null),
