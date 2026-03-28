@@ -1143,7 +1143,26 @@ function applyCheckoutPrices(items, priceMap) {
     const quantity = Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1;
     const unitPriceValue = parseMoneyToNumber(matchedPrice || item.priceText);
     const rawAddOnsTotalValue = Number.isFinite(item._addOnsTotalValue) ? Number(item._addOnsTotalValue) : 0;
-    const addOnsTotalValue = matchedPriceRecord ? 0 : rawAddOnsTotalValue;
+
+    const draftUnitPriceValue = parseMoneyToNumber(item.priceText);
+    const draftBaseLineValue = Number.isFinite(draftUnitPriceValue)
+      ? Number(((item._isUnitPrice !== false ? draftUnitPriceValue * quantity : draftUnitPriceValue)).toFixed(2))
+      : null;
+    const matchedLineValue = Number.isFinite(unitPriceValue)
+      ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue)).toFixed(2))
+      : null;
+
+    // Checkout price can be either base-only or already include modifiers depending on payload shape.
+    // If matched line is near draft base line, keep draft add-ons; otherwise assume checkout already includes them.
+    let addOnsTotalValue = rawAddOnsTotalValue;
+    if (matchedPriceRecord && rawAddOnsTotalValue > 0 && Number.isFinite(matchedLineValue) && Number.isFinite(draftBaseLineValue)) {
+      const deltaToDraftBase = Math.abs(matchedLineValue - draftBaseLineValue);
+      const deltaToDraftWithAddOns = Math.abs(matchedLineValue - (draftBaseLineValue + rawAddOnsTotalValue));
+      addOnsTotalValue = deltaToDraftBase <= deltaToDraftWithAddOns ? rawAddOnsTotalValue : 0;
+    } else if (matchedPriceRecord && rawAddOnsTotalValue > 0 && !Number.isFinite(draftBaseLineValue)) {
+      addOnsTotalValue = 0;
+    }
+
     const lineTotalValue = Number.isFinite(unitPriceValue)
       ? Number(((isUnitPrice ? unitPriceValue * quantity : unitPriceValue) + addOnsTotalValue).toFixed(2))
       : (addOnsTotalValue > 0 ? Number(addOnsTotalValue.toFixed(2)) : null);
@@ -1168,6 +1187,8 @@ function applyCheckoutPrices(items, priceMap) {
         matchedByNameQty: Boolean(matchedByNameQty),
         matchedPriceText: matchedPrice || null,
         draftPriceText: item.priceText || null,
+        draftBaseLineValue: Number.isFinite(draftBaseLineValue) ? draftBaseLineValue : null,
+        matchedLineValue: Number.isFinite(matchedLineValue) ? matchedLineValue : null,
         rawAddOnsTotalValue: Number(rawAddOnsTotalValue.toFixed(2)),
         appliedAddOnsTotalValue: Number(addOnsTotalValue.toFixed(2)),
         isUnitPrice
@@ -1369,6 +1390,23 @@ function extractItemsFromDraftOrderPayload(payload) {
         continue;
       }
 
+      const groupHasSelectionSignals = entry.some((option) => {
+        if (!option || typeof option !== 'object') {
+          return false;
+        }
+
+        const selectedQtyRaw = option.selectedQuantity ?? option.selectedQty ?? null;
+        const selectedQty = Number(selectedQtyRaw);
+        return Boolean(
+          option.selected === true
+          || option.isSelected === true
+          || option.isChosen === true
+          || option.checked === true
+          || option.is_checked === true
+          || (Number.isFinite(selectedQty) && selectedQty > 0)
+        );
+      });
+
       for (const option of entry) {
         if (!option || typeof option !== 'object') {
           continue;
@@ -1387,21 +1425,26 @@ function extractItemsFromDraftOrderPayload(payload) {
           || option.is_checked === true
         );
         const hasSelectedQty = Number.isFinite(selectedQty) && selectedQty > 0;
+        const hasPositiveFallbackQty = Number.isFinite(fallbackQty) && fallbackQty > 0;
 
         if (!optionName || isLikelyNoiseText(optionName)) {
           continue;
         }
 
-        // Some payloads include full option catalogs with generic quantity fields.
-        // Only count options that are explicitly selected or have selectedQuantity signals.
-        if (!isExplicitlySelected && !hasSelectedQty) {
+        // If this group exposes explicit selection signals, trust only those signals.
+        // Otherwise, treat positive generic quantity as selected (selected-only payload shape).
+        const isSelected = groupHasSelectionSignals
+          ? (isExplicitlySelected || hasSelectedQty)
+          : (isExplicitlySelected || hasSelectedQty || hasPositiveFallbackQty);
+
+        if (!isSelected) {
           continue;
         }
 
         let normalizedQty = 1;
         if (hasSelectedQty) {
           normalizedQty = selectedQty;
-        } else if (isExplicitlySelected && Number.isFinite(fallbackQty) && fallbackQty > 0) {
+        } else if (hasPositiveFallbackQty) {
           normalizedQty = fallbackQty;
         }
 
